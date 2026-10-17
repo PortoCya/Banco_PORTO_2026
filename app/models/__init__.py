@@ -18,6 +18,7 @@ from app.models.models import (
     Gerenciacao,
     SoaIa,
     AnaliseFeedback,
+    LogAuditoria,
 )
 
 __all__ = [
@@ -37,4 +38,5 @@ __all__ = [
     "Gerenciacao",
     "SoaIa",
     "AnaliseFeedback",
+    "LogAuditoria",
 ]

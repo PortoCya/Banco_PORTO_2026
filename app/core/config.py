@@ -1,6 +1,7 @@
 """
 Configurações da aplicação via variáveis de ambiente (Pydantic Settings).
 """
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
@@ -18,9 +19,16 @@ class Settings(BaseSettings):
     DB_ECHO: bool = False          # True → loga SQL no console
 
     # ── Segurança ────────────────────────────────────────────────────────────
-    SECRET_KEY: str = "TROQUE_ESTA_CHAVE_EM_PRODUCAO"
+    # Sem valor padrão: a aplicação não sobe sem SECRET_KEY no ambiente.
+    # Gere com: openssl rand -hex 32
+    SECRET_KEY: str = Field(..., min_length=32)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     ALGORITHM: str = "HS256"
+
+    # ── Rate limit do login (janela deslizante) ──────────────────────────────
+    LOGIN_JANELA_SEGUNDOS: int = 900          # 15 min
+    LOGIN_MAX_TENTATIVAS_IP: int = 20         # qualquer tentativa, por IP
+    LOGIN_MAX_FALHAS_EMAIL: int = 5           # só falhas, por e-mail
 
     # ── IA / OpenAI ──────────────────────────────────────────────────────────
     OPENAI_API_KEY: Optional[str] = None

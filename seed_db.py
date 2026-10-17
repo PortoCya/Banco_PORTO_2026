@@ -3,11 +3,18 @@ Script utilitário: cria as tabelas do banco e popula dados iniciais (seed).
 Execute: python seed_db.py
 """
 import logging
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # ADMIN_EMAIL/ADMIN_SENHA/SECRET_KEY vêm do .env
 
 from app.core.database import Base, engine, SessionLocal
 import app.models.models  # noqa: F401 — registra todos os modelos
 
+from app.core.security import gerar_hash_senha
 from app.models.models import VideoModelo, Prompt, Usuario, TutorCircuitoTreinado
+from app.schemas.schemas import SENHA_MIN
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,15 +63,22 @@ def popular_dados():
             )
             db.add(prompt)
 
-        # Usuário admin padrão
-        if not db.query(Usuario).filter(Usuario.email == "admin@consultoria.ai").first():
-            admin = Usuario(
-                nome="Administrador",
-                email="admin@consultoria.ai",
-                role="ADMIN",
-                status="ativo",
+        # Primeiro ADMIN: credenciais só pelo ambiente, nunca fixas no código
+        admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+        admin_senha = os.environ.get("ADMIN_SENHA", "")
+        if not admin_email or len(admin_senha) < SENHA_MIN:
+            logger.warning(
+                "ADMIN_EMAIL/ADMIN_SENHA não definidos (senha mín. %d caracteres) — "
+                "nenhum ADMIN criado.", SENHA_MIN,
             )
-            db.add(admin)
+        elif not db.query(Usuario).filter(Usuario.email == admin_email).first():
+            db.add(Usuario(
+                nome="Administrador",
+                email=admin_email,
+                senha_hash=gerar_hash_senha(admin_senha),
+                papel="ADMIN",
+            ))
+            logger.info("ADMIN inicial criado.")
 
         db.commit()
         logger.info("Dados iniciais inseridos com sucesso.")

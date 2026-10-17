@@ -27,6 +27,21 @@ Nomes de campos na API = nomes das colunas no banco (sem tradução). Código e 
 - `ANALYST`: NPS, histórico, export **anonimizado**, revisar/descartar sugestões da IA.
 - `RESPONDENT`: público, sem login, só `GET/POST /public/respostas/{token}`.
 
+## Autenticação e segurança
+
+Já implementado. Reutilize, não reescreva:
+
+- **Rotas protegidas:** `Depends(get_usuario_atual)` ou `Depends(requer_papel("ADMIN"))` de `app/api/deps.py`. Toda rota não pública precisa de um dos dois; esconder botão no front não é controle de acesso.
+- **Senha:** só via `gerar_hash_senha`/`verificar_senha` (`app/core/security.py`, Argon2id). Senha de 12 a 128 caracteres. Nunca retornar `senha_hash` em resposta nem em auditoria.
+- **JWT:** HS256, `sub` = uuid do usuário, expira em `ACCESS_TOKEN_EXPIRE_MINUTES`. Papel e `ativo` são lidos do banco a cada requisição (desativar ou trocar papel vale na hora).
+- **Login:** erro sempre genérico ("E-mail ou senha inválidos."), sem revelar se o e-mail existe. Rate limit por IP e por e-mail (`app/core/rate_limit.py`, em memória; migrar para Redis mantendo a interface).
+- **Auditoria:** ação administrativa chama `registrar_auditoria(...)` (`app/services/auditoria.py`) antes do `commit`, na mesma transação.
+- **Segredos:** só por variável de ambiente (`.env`, ignorado pelo git). `SECRET_KEY` não tem padrão: sem ela a app não sobe.
+- **Logs:** nunca logar senha, token, hash ou o `input` de erros de validação.
+- **SQL:** sempre via ORM/parâmetros; nunca f-string em `text()`.
+- **Chamadas externas:** sempre com timeout explícito.
+- **Primeiro ADMIN:** `ADMIN_EMAIL` e `ADMIN_SENHA` no `.env` + `python seed_db.py`.
+
 ## Regras do núcleo
 
 - **NPS** = %promotores (9–10) − %detratores (0–6). Neutros (7–8) só contam no total. Inteiro de −100 a +100, arredondamento meio para cima. Sem respostas → `valor_nps: null`, `status: "sem_dados_suficientes"` (nunca 0). Lógica em serviço de domínio, fora das rotas.

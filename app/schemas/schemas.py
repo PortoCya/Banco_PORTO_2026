@@ -29,20 +29,54 @@ class ErrorResponse(BaseModel):
 # USUARIO
 # ══════════════════════════════════════════════════════════════════
 
+# Teto de 128 evita que uma senha gigante deixe o Argon2 lento de propósito
+SENHA_MIN, SENHA_MAX = 12, 128
+
+
 class UsuarioCreate(BaseModel):
     nome: str = Field(..., min_length=2, max_length=200)
-    email: EmailStr
-    role: str = Field("ANALISTA", pattern="^(ADMIN|ANALISTA|PT)$")
+    email: EmailStr = Field(..., max_length=200)
+    senha: str = Field(..., min_length=SENHA_MIN, max_length=SENHA_MAX)
+    papel: str = Field("ANALYST", pattern="^(ADMIN|ANALYST)$")
+
+    @field_validator("email")
+    @classmethod
+    def email_minusculo(cls, v: str) -> str:
+        return v.lower()
+
+class UsuarioUpdate(BaseModel):
+    nome: Optional[str] = Field(None, min_length=2, max_length=200)
+    papel: Optional[str] = Field(None, pattern="^(ADMIN|ANALYST)$")
+    ativo: Optional[bool] = None
 
 class UsuarioResponse(BaseModel):
     uuid: str
     nome: str
     email: str
-    role: str
-    status: str
-    created_at: datetime
+    papel: str
+    ativo: bool
+    criado_em: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ══════════════════════════════════════════════════════════════════
+# AUTENTICAÇÃO
+# ══════════════════════════════════════════════════════════════════
+
+class LoginRequest(BaseModel):
+    email: EmailStr = Field(..., max_length=200)
+    senha: str = Field(..., min_length=1, max_length=SENHA_MAX)
+
+    @field_validator("email")
+    @classmethod
+    def email_minusculo(cls, v: str) -> str:
+        return v.lower()
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int                 # segundos
 
 
 # ══════════════════════════════════════════════════════════════════

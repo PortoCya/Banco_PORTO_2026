@@ -141,10 +141,11 @@ class Usuario(Base):
 
     uuid       = Column(String(36), primary_key=True, default=_uuid)
     nome       = Column(String(200), nullable=False)
-    email      = Column(String(200), unique=True, nullable=False, index=True)  # ADMIN/ANALISTA/PT
-    role       = Column(Enum("ADMIN", "ANALISTA", "PT", name="role_enum"), nullable=False, default="ANALISTA")
-    status     = Column(String(30), default="ativo")
-    created_at = Column(DateTime, default=_now)
+    email      = Column(String(200), unique=True, nullable=False, index=True)  # sempre minúsculo
+    senha_hash = Column(String(255), nullable=False)                           # Argon2id
+    papel      = Column(Enum("ADMIN", "ANALYST", name="papel_enum"), nullable=False, default="ANALYST")
+    ativo      = Column(Boolean, nullable=False, default=True)
+    criado_em  = Column(DateTime, default=_now)
 
     conversas  = relationship("Conversa", back_populates="usuario")
     gerenciacoes = relationship("Gerenciacao", back_populates="usuario")
@@ -322,3 +323,19 @@ class AnaliseFeedback(Base):
     created_at         = Column(DateTime, default=_now)
 
     gerenciacao        = relationship("Gerenciacao", back_populates="analises_feedback")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 17. LOG_AUDITORIA
+# ══════════════════════════════════════════════════════════════════
+class LogAuditoria(Base):
+    __tablename__ = "log_auditoria"
+
+    id               = Column(String(36), primary_key=True, default=_uuid)
+    id_usuario_ator  = Column(String(36), ForeignKey("usuario.uuid"), nullable=False)
+    acao             = Column(String(100), nullable=False)
+    tipo_entidade    = Column(String(100), nullable=False)
+    id_entidade      = Column(String(36), nullable=False)
+    estado_antes     = Column(JSON, nullable=True)
+    estado_depois    = Column(JSON, nullable=True)
+    criado_em        = Column(DateTime, default=_now)

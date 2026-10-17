@@ -33,6 +33,21 @@ class ValidationError(AppError):
     error_code = "VALIDATION_ERROR"
 
 
+class UnauthorizedError(AppError):
+    status_code = 401
+    error_code = "UNAUTHORIZED"
+
+
+class ForbiddenError(AppError):
+    status_code = 403
+    error_code = "FORBIDDEN"
+
+
+class TooManyRequestsError(AppError):
+    status_code = 429
+    error_code = "TOO_MANY_REQUESTS"
+
+
 class NotFoundError(AppError):
     status_code = 404
     error_code = "NOT_FOUND"
@@ -93,12 +108,18 @@ def register_exception_handlers(app: FastAPI) -> None:
     # 1. Dados inválidos (Pydantic / FastAPI)
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        logger.warning("Dados inválidos na requisição %s: %s", request.url, exc.errors())
+        # Só local, mensagem e tipo: o valor enviado ("input") pode ser uma senha
+        # e não pode ir para o log nem voltar na resposta.
+        campos = [
+            {"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")}
+            for e in exc.errors()
+        ]
+        logger.warning("Dados inválidos na requisição %s: %s", request.url.path, campos)
         return _error_response(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "VALIDATION_ERROR",
             "Dados de entrada inválidos.",
-            fields=exc.errors(),
+            fields=campos,
         )
 
     # 2. Erros customizados da aplicação
