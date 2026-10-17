@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     LOGIN_MAX_TENTATIVAS_IP: int = 20         # qualquer tentativa, por IP
     LOGIN_MAX_FALHAS_EMAIL: int = 5           # só falhas, por e-mail
 
+    # ── CORS ─────────────────────────────────────────────────────────────────
+    # Lista separada por vírgula. Nunca "*" junto com credenciais.
+    CORS_ORIGINS: str = "http://localhost:3000"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
     # ── IA / OpenAI ──────────────────────────────────────────────────────────
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o"

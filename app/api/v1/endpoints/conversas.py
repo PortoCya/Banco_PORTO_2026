@@ -2,16 +2,19 @@
 Endpoints — Conversas e consulta principal à IA.
 Fluxo: Frontend → /conversas/consultar → LOA_PUNICAO → GERENCIACAO → SOA_IA → IA → ANALISE_FEEDBACK → resposta
 """
+import logging
 import uuid as uuid_lib
-from datetime import datetime
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, status, BackgroundTasks
+from fastapi import APIRouter, Depends, Query, status, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
-from app.core.errors import NotFoundError
-from app.models.models import Conversa, LoaPunicao, Gerenciacao, SoaIa, AnaliseFeedback, Prompt, VideoModelo
+from app.api.deps import buscar_conversa_do_usuario, buscar_gerenciacao_do_usuario, get_usuario_atual
+from app.core.database import SessionLocal, get_db
+from app.models.models import (
+    Conversa, LoaPunicao, Gerenciacao, SoaIa, AnaliseFeedback, Prompt, VideoModelo, Usuario,
+)
 from app.schemas.schemas import (
     ConversaCreate, ConversaResponse,
     MensagemInput, ConsultaIAResponse,
@@ -20,7 +23,10 @@ from app.schemas.schemas import (
 )
 from app.services.ia_service import gerar_resposta_ia, analisar_sentimento
 
-router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# Todas as rotas deste arquivo exigem login
+router = APIRouter(dependencies=[Depends(get_usuario_atual)])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -34,13 +40,17 @@ router = APIRouter()
     summary="Criar nova conversa",
     tags=["Conversas"],
 )
-def criar_conversa(payload: ConversaCreate, db: Session = Depends(get_db)):
+def criar_conversa(
+    payload: ConversaCreate,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
-    **Recebe:** fk_usuario, titulo, tipo_consultor, configuracoes
+    **Recebe:** titulo, tipo_consultor, configuracoes (o dono é o usuário logado)
     **Retorna:** objeto da conversa criada
-    **Códigos:** 201 | 404 (usuario não existe) | 422
+    **Códigos:** 201 | 401 | 422
     """
-    conversa = Conversa(**payload.model_dump())
+    conversa = Conversa(**payload.model_dump(), fk_usuario=usuario.uuid)
     db.add(conversa)
     db.commit()
     db.refresh(conversa)
@@ -54,19 +64,22 @@ def criar_conversa(payload: ConversaCreate, db: Session = Depends(get_db)):
     tags=["Conversas"],
 )
 def listar_conversas(
-    fk_usuario: str = None,
-    status: str = None,
-    skip: int = 0,
-    limit: int = 50,
+    fk_usuario: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
 ):
     """
-    **Recebe:** filtros opcionais fk_usuario e status
+    **Recebe:** filtros opcionais fk_usuario (só ADMIN) e status
     **Retorna:** lista paginada de conversas
-    **Códigos:** 200
+    **Códigos:** 200 | 401
     """
     q = db.query(Conversa)
-    if fk_usuario:
+    if usuario.papel != "ADMIN":
+        q = q.filter(Conversa.fk_usuario == usuario.uuid)
+    elif fk_usuario:
         q = q.filter(Conversa.fk_usuario == fk_usuario)
     if status:
         q = q.filter(Conversa.status == status)
@@ -79,16 +92,17 @@ def listar_conversas(
     summary="Buscar conversa por UUID",
     tags=["Conversas"],
 )
-def buscar_conversa(uuid: str, db: Session = Depends(get_db)):
+def buscar_conversa(
+    uuid: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** uuid no path
     **Retorna:** objeto da conversa
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 404
     """
-    conversa = db.query(Conversa).filter(Conversa.uuid == uuid).first()
-    if not conversa:
-        raise NotFoundError(f"Conversa '{uuid}' não encontrada.")
-    return conversa
+    return buscar_conversa_do_usuario(db, uuid, usuario)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -107,6 +121,7 @@ async def consultar_ia(
     payload: MensagemInput,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
 ):
     """
     **Fluxo completo:**
@@ -122,12 +137,10 @@ async def consultar_ia(
 
     **Recebe:** conversa_uuid, mensagem, tipo_consultor (opcional)
     **Retorna:** resposta da IA + metadados de uso
-    **Códigos:** 200 | 404 | 422 | 502 | 504
+    **Códigos:** 200 | 401 | 404 | 422 | 502 | 503 | 504
     """
     # 1. Valida conversa
-    conversa = db.query(Conversa).filter(Conversa.uuid == payload.conversa_uuid).first()
-    if not conversa:
-        raise NotFoundError(f"Conversa '{payload.conversa_uuid}' não encontrada.")
+    conversa = buscar_conversa_do_usuario(db, payload.conversa_uuid, usuario)
 
     # 2. Registra LOA_PUNICAO (atributos de entrada)
     loa = LoaPunicao(
@@ -174,11 +187,18 @@ async def consultar_ia(
         else "Você é um consultor especializado. Responda de forma clara e objetiva."
     )
 
-    # 6. Chama a IA (erros tratados em ia_service → propagados para error handlers)
-    resultado_ia = await gerar_resposta_ia(
-        prompt_sistema=prompt_sistema,
-        mensagem_usuario=payload.mensagem,
-    )
+    # 6. Chama a IA (erros tratados em ia_service → propagados para error handlers).
+    # Se falhar, marca FALHA antes de propagar, para não ficar PROCESSANDO para sempre.
+    try:
+        resultado_ia = await gerar_resposta_ia(
+            prompt_sistema=prompt_sistema,
+            mensagem_usuario=payload.mensagem,
+        )
+    except Exception:
+        soa.status = "FALHA"
+        gerenciacao.status = "FALHA"
+        db.commit()
+        raise
 
     # 7. Atualiza SOA_IA
     soa.status = "CONCLUIDO"
@@ -202,31 +222,25 @@ async def consultar_ia(
         tokens_saida=resultado_ia["tokens_saida"],
         modelo_utilizado=resultado_ia["modelo_utilizado"],
         finish_reason=resultado_ia["finish_reason"],
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
 
 
 async def _salvar_analise_feedback(gerenciacao_uuid: str, texto: str, fk_video_modelo: str = None):
     """Tarefa de background: analisa sentimento e persiste ANALISE_FEEDBACK."""
-    from app.core.database import SessionLocal
     db = SessionLocal()
     try:
-        resultado = await analisar_sentimento(texto)
-        fb = AnaliseFeedback(
+        resultado = await analisar_sentimento(texto)   # já validado pelo Pydantic
+        db.add(AnaliseFeedback(
             fk_gerenciacao=gerenciacao_uuid,
             fk_video_modelo=fk_video_modelo,
-            sentimento=resultado.get("sentimento", "NEUTRO"),
-            tema=resultado.get("tema"),
-            confianca=resultado.get("confianca"),
-            justificativa=resultado.get("justificativa"),
-            sugestoes_acao=resultado.get("sugestoes_acao"),
+            **resultado,
             status="CONCLUIDO",
-        )
-        db.add(fb)
+        ))
         db.commit()
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).error("Erro ao salvar análise de feedback: %s", exc)
+        # Só o tipo: a mensagem pode trazer trechos do texto analisado
+        logger.error("Erro ao salvar análise de feedback (%s)", type(exc).__name__)
         db.rollback()
     finally:
         db.close()
@@ -243,12 +257,17 @@ async def _salvar_analise_feedback(gerenciacao_uuid: str, texto: str, fk_video_m
     summary="Registrar LOA / Punição",
     tags=["LOA Punição"],
 )
-def criar_loa_punicao(payload: LoaPunicaoCreate, db: Session = Depends(get_db)):
+def criar_loa_punicao(
+    payload: LoaPunicaoCreate,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** fk_conversa_set, tipo, boolean_status, valor, metodo_ativo
     **Retorna:** registro criado
-    **Códigos:** 201 | 422
+    **Códigos:** 201 | 401 | 404 | 422
     """
+    buscar_conversa_do_usuario(db, payload.fk_conversa_set, usuario)
     loa = LoaPunicao(**payload.model_dump())
     db.add(loa)
     db.commit()
@@ -262,15 +281,17 @@ def criar_loa_punicao(payload: LoaPunicaoCreate, db: Session = Depends(get_db)):
     summary="Listar LOAs de uma conversa",
     tags=["LOA Punição"],
 )
-def listar_loa_punicao(conversa_uuid: str, db: Session = Depends(get_db)):
+def listar_loa_punicao(
+    conversa_uuid: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** conversa_uuid no path
     **Retorna:** lista de LOAs associadas
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 404
     """
-    conversa = db.query(Conversa).filter(Conversa.uuid == conversa_uuid).first()
-    if not conversa:
-        raise NotFoundError(f"Conversa '{conversa_uuid}' não encontrada.")
+    buscar_conversa_do_usuario(db, conversa_uuid, usuario)
     return db.query(LoaPunicao).filter(LoaPunicao.fk_conversa_set == conversa_uuid).all()
 
 
@@ -285,18 +306,22 @@ def listar_loa_punicao(conversa_uuid: str, db: Session = Depends(get_db)):
     tags=["Análise Feedback"],
 )
 def listar_analises_feedback(
-    fk_gerenciacao: str = None,
-    sentimento: str = None,
-    skip: int = 0,
-    limit: int = 50,
+    fk_gerenciacao: Optional[str] = None,
+    sentimento: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
 ):
     """
     **Recebe:** filtros opcionais fk_gerenciacao e sentimento
-    **Retorna:** lista paginada
-    **Códigos:** 200
+    **Retorna:** lista paginada (só das gerenciações do usuário, exceto ADMIN)
+    **Códigos:** 200 | 401
     """
     q = db.query(AnaliseFeedback)
+    if usuario.papel != "ADMIN":
+        q = q.join(Gerenciacao, AnaliseFeedback.fk_gerenciacao == Gerenciacao.uuid) \
+             .filter(Gerenciacao.fk_pessoa == usuario.uuid)
     if fk_gerenciacao:
         q = q.filter(AnaliseFeedback.fk_gerenciacao == fk_gerenciacao)
     if sentimento:
@@ -311,22 +336,23 @@ def listar_analises_feedback(
     summary="Solicitar análise de feedback manualmente",
     tags=["Análise Feedback"],
 )
-async def criar_analise_feedback(payload: AnaliseFeedbackCreate, db: Session = Depends(get_db)):
+async def criar_analise_feedback(
+    payload: AnaliseFeedbackCreate,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     Dispara análise de sentimento via IA manualmente.
     **Recebe:** fk_gerenciacao, fk_video_modelo, texto_para_analisar
     **Retorna:** resultado da análise
-    **Códigos:** 201 | 422 | 502
+    **Códigos:** 201 | 401 | 404 | 422 | 502 | 503
     """
+    buscar_gerenciacao_do_usuario(db, payload.fk_gerenciacao, usuario)
     resultado = await analisar_sentimento(payload.texto_para_analisar)
     fb = AnaliseFeedback(
         fk_gerenciacao=payload.fk_gerenciacao,
         fk_video_modelo=payload.fk_video_modelo,
-        sentimento=resultado.get("sentimento", "NEUTRO"),
-        tema=resultado.get("tema"),
-        confianca=resultado.get("confianca"),
-        justificativa=resultado.get("justificativa"),
-        sugestoes_acao=resultado.get("sugestoes_acao"),
+        **resultado,
         status="CONCLUIDO",
     )
     db.add(fb)

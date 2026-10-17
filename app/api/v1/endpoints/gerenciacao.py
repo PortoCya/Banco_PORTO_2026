@@ -1,14 +1,15 @@
 """
 Endpoints — Gerenciacao, SOA_IA, Prompts, Dimensões KPIs
 """
-from typing import List
-from fastapi import APIRouter, Depends, status
+from typing import List, Literal, Optional
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.orm import Session
 import uuid as uuid_lib
 
+from app.api.deps import buscar_gerenciacao_do_usuario, get_usuario_atual, requer_papel
 from app.core.database import get_db
 from app.core.errors import NotFoundError
-from app.models.models import Gerenciacao, SoaIa, Prompt, DimensoesKpis
+from app.models.models import Gerenciacao, SoaIa, Prompt, DimensoesKpis, Usuario
 from app.schemas.schemas import (
     GerenciacaoCreate, GerenciacaoResponse,
     SoaIaResponse,
@@ -16,7 +17,8 @@ from app.schemas.schemas import (
     DimensoesKpisResponse,
 )
 
-router = APIRouter()
+# Todas as rotas deste arquivo exigem login
+router = APIRouter(dependencies=[Depends(get_usuario_atual)])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -30,14 +32,22 @@ router = APIRouter()
     summary="Criar sessão de gerenciação",
     tags=["Gerenciação"],
 )
-def criar_gerenciacao(payload: GerenciacaoCreate, db: Session = Depends(get_db)):
+def criar_gerenciacao(
+    payload: GerenciacaoCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
-    **Recebe:** fk_pessoa, tipo_pot, fingerprint_dispositivo, credencial_ip
+    **Recebe:** tipo_pot, fingerprint_dispositivo
+    O dono é o usuário logado e o IP vem da conexão (não do corpo, que é forjável).
     **Retorna:** registro de gerenciação com chave_referencia única
-    **Códigos:** 201 | 422
+    **Códigos:** 201 | 401 | 422
     """
     gerenciacao = Gerenciacao(
         **payload.model_dump(),
+        fk_pessoa=usuario.uuid,
+        credencial_ip=request.client.host if request.client else None,
         status="ABERTO",
         chave_referencia=str(uuid_lib.uuid4()),
     )
@@ -53,16 +63,17 @@ def criar_gerenciacao(payload: GerenciacaoCreate, db: Session = Depends(get_db))
     summary="Buscar gerenciação por UUID",
     tags=["Gerenciação"],
 )
-def buscar_gerenciacao(uuid: str, db: Session = Depends(get_db)):
+def buscar_gerenciacao(
+    uuid: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** uuid no path
     **Retorna:** objeto de gerenciação
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 404
     """
-    g = db.query(Gerenciacao).filter(Gerenciacao.uuid == uuid).first()
-    if not g:
-        raise NotFoundError(f"Gerenciação '{uuid}' não encontrada.")
-    return g
+    return buscar_gerenciacao_do_usuario(db, uuid, usuario)
 
 
 @router.get(
@@ -72,19 +83,22 @@ def buscar_gerenciacao(uuid: str, db: Session = Depends(get_db)):
     tags=["Gerenciação"],
 )
 def listar_gerenciacoes(
-    fk_pessoa: str = None,
-    status_filtro: str = None,
-    skip: int = 0,
-    limit: int = 50,
+    fk_pessoa: Optional[str] = None,
+    status_filtro: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
 ):
     """
-    **Recebe:** filtros opcionais por pessoa e status
+    **Recebe:** filtros opcionais por pessoa (só ADMIN) e status
     **Retorna:** lista paginada
-    **Códigos:** 200
+    **Códigos:** 200 | 401
     """
     q = db.query(Gerenciacao)
-    if fk_pessoa:
+    if usuario.papel != "ADMIN":
+        q = q.filter(Gerenciacao.fk_pessoa == usuario.uuid)
+    elif fk_pessoa:
         q = q.filter(Gerenciacao.fk_pessoa == fk_pessoa)
     if status_filtro:
         q = q.filter(Gerenciacao.status == status_filtro)
@@ -99,22 +113,17 @@ def listar_gerenciacoes(
 )
 def atualizar_status_gerenciacao(
     uuid: str,
-    novo_status: str,
+    novo_status: Literal["ABERTO", "PROCESSANDO", "CONCLUIDO", "FALHA", "PENDENTE"],
     db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
 ):
     """
     **Recebe:** uuid no path, novo_status como query param
     Valores válidos: ABERTO | PROCESSANDO | CONCLUIDO | FALHA | PENDENTE
     **Retorna:** gerenciação atualizada
-    **Códigos:** 200 | 404 | 422
+    **Códigos:** 200 | 401 | 404 | 422
     """
-    validos = {"ABERTO", "PROCESSANDO", "CONCLUIDO", "FALHA", "PENDENTE"}
-    if novo_status not in validos:
-        from app.core.errors import ValidationError
-        raise ValidationError(f"Status inválido. Use: {validos}")
-    g = db.query(Gerenciacao).filter(Gerenciacao.uuid == uuid).first()
-    if not g:
-        raise NotFoundError(f"Gerenciação '{uuid}' não encontrada.")
+    g = buscar_gerenciacao_do_usuario(db, uuid, usuario)
     g.status = novo_status
     db.commit()
     db.refresh(g)
@@ -131,14 +140,22 @@ def atualizar_status_gerenciacao(
     summary="Buscar status SOA_IA",
     tags=["SOA IA"],
 )
-def buscar_soa_ia(uuid: str, db: Session = Depends(get_db)):
+def buscar_soa_ia(
+    uuid: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** uuid do SOA_IA
     **Retorna:** status do orquestrador IA
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 404
     """
     soa = db.query(SoaIa).filter(SoaIa.uuid == uuid).first()
     if not soa:
+        raise NotFoundError(f"SOA_IA '{uuid}' não encontrado.")
+    try:
+        buscar_gerenciacao_do_usuario(db, soa.fk_gerenciacao, usuario)
+    except NotFoundError:
         raise NotFoundError(f"SOA_IA '{uuid}' não encontrado.")
     return soa
 
@@ -149,12 +166,17 @@ def buscar_soa_ia(uuid: str, db: Session = Depends(get_db)):
     summary="Buscar SOA_IA por gerenciação",
     tags=["SOA IA"],
 )
-def buscar_soa_ia_por_gerenciacao(gerenciacao_uuid: str, db: Session = Depends(get_db)):
+def buscar_soa_ia_por_gerenciacao(
+    gerenciacao_uuid: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** gerenciacao_uuid no path
     **Retorna:** SOA_IA associado
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 404
     """
+    buscar_gerenciacao_do_usuario(db, gerenciacao_uuid, usuario)
     soa = db.query(SoaIa).filter(SoaIa.fk_gerenciacao == gerenciacao_uuid).first()
     if not soa:
         raise NotFoundError(f"SOA_IA para gerenciação '{gerenciacao_uuid}' não encontrado.")
@@ -171,12 +193,13 @@ def buscar_soa_ia_por_gerenciacao(gerenciacao_uuid: str, db: Session = Depends(g
     status_code=status.HTTP_201_CREATED,
     summary="Criar prompt de engenharia",
     tags=["Prompts"],
+    dependencies=[Depends(requer_papel("ADMIN"))],
 )
 def criar_prompt(payload: PromptCreate, db: Session = Depends(get_db)):
     """
     **Recebe:** fk_video_modelo, conteudo, contexto, template, status_ativo
     **Retorna:** prompt criado
-    **Códigos:** 201 | 422
+    **Códigos:** 201 | 401 | 403 | 422
     """
     prompt = Prompt(**payload.model_dump())
     db.add(prompt)
@@ -208,12 +231,13 @@ def listar_prompts(apenas_ativos: bool = True, db: Session = Depends(get_db)):
     response_model=PromptResponse,
     summary="Desativar prompt",
     tags=["Prompts"],
+    dependencies=[Depends(requer_papel("ADMIN"))],
 )
 def desativar_prompt(uuid: str, db: Session = Depends(get_db)):
     """
     **Recebe:** uuid no path
     **Retorna:** prompt atualizado
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 403 | 404
     """
     p = db.query(Prompt).filter(Prompt.uuid == uuid).first()
     if not p:
@@ -234,13 +258,15 @@ def desativar_prompt(uuid: str, db: Session = Depends(get_db)):
     summary="Buscar KPIs de uma gerenciação",
     tags=["KPIs"],
 )
-def buscar_dimensoes_kpis(gerenciacao_uuid: str, db: Session = Depends(get_db)):
+def buscar_dimensoes_kpis(
+    gerenciacao_uuid: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(get_usuario_atual),
+):
     """
     **Recebe:** gerenciacao_uuid no path
     **Retorna:** lista de dimensões de KPI
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 404
     """
-    g = db.query(Gerenciacao).filter(Gerenciacao.uuid == gerenciacao_uuid).first()
-    if not g:
-        raise NotFoundError(f"Gerenciação '{gerenciacao_uuid}' não encontrada.")
+    buscar_gerenciacao_do_usuario(db, gerenciacao_uuid, usuario)
     return db.query(DimensoesKpis).filter(DimensoesKpis.fk_gerencia == gerenciacao_uuid).all()

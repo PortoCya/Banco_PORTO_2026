@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.config import settings
 from app.core.database import Base, engine
@@ -49,10 +48,10 @@ app = FastAPI(
 # ─── Middlewares ──────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # ajuste para domínios específicos em produção
+    allow_origins=settings.cors_origins,   # CORS_ORIGINS no .env
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # ─── Exception Handlers ───────────────────────────────────────────────────────

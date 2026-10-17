@@ -105,8 +105,15 @@ DATABASE_URL=sqlite:///./ai_consulting.db
 # IA — OpenAI (obrigatório para endpoints de IA)
 OPENAI_API_KEY=sk-...
 
-# Segurança
+# Segurança (obrigatória, mín. 32 caracteres — sem ela a API não sobe)
 SECRET_KEY=gere_uma_chave_segura_aqui
+
+# Primeiro ADMIN, criado pelo seed_db.py (senha mín. 12 caracteres)
+ADMIN_EMAIL=voce@empresa.com
+ADMIN_SENHA=uma-senha-forte-aqui
+
+# Origens do front liberadas no CORS
+CORS_ORIGINS=http://localhost:3000
 ```
 
 > **Gerar SECRET_KEY segura:**
@@ -135,7 +142,7 @@ Isso cria automaticamente:
 - 16 tabelas no banco
 - Modelo de IA padrão (`gpt-4o`)
 - Tutor base e prompt do sistema
-- Usuário admin (`admin@consultoria.ai`)
+- Usuário ADMIN com `ADMIN_EMAIL`/`ADMIN_SENHA` do `.env` (se não estiverem definidos, nenhum ADMIN é criado)
 
 ### 7. Iniciar o servidor
 
@@ -189,7 +196,7 @@ USUARIO ──┬──── CONVERSA ──── LOA_PUNICAO ──── MAT
 | 4 | `avaliacao_circuito_set` | Avaliações de benchmark do circuito |
 | 5 | `prompt` | Engenharia de prompts do sistema |
 | 6 | `configurar_circuito_set` | Configuração fina do circuito |
-| 7 | `usuario` | Usuários (ADMIN / ANALISTA / PT) |
+| 7 | `usuario` | Usuários (ADMIN / ANALYST), senha em Argon2id |
 | 8 | `conversa` | Sessões de conversa com a IA |
 | 9 | `loa_punicao` | Atributos e punições de entrada |
 | 10 | `matriz_punicao_set` | Matriz de pontuação e relevância |
@@ -199,6 +206,7 @@ USUARIO ──┬──── CONVERSA ──── LOA_PUNICAO ──── MAT
 | 14 | `gerenciacao` | Hub central de sessões de processamento |
 | 15 | `soa_ia` | Orquestrador de chamadas IA (fila/status) |
 | 16 | `analise_feedback` | Análise de sentimento gerada pela IA |
+| 17 | `log_auditoria` | Quem fez o quê, quando, com estado antes/depois |
 
 ### Chaves e Restrições
 
@@ -208,7 +216,7 @@ USUARIO ──┬──── CONVERSA ──── LOA_PUNICAO ──── MAT
 | **FK** | `CASCADE` em relações pai-filho; `SET NULL` em relações opcionais |
 | **UK** | `usuario.email`, `gerenciacao.chave_referencia` |
 | **INDEX** | `usuario.email`, `gerenciacao.chave_referencia` |
-| **ENUM** | `usuario.role` (ADMIN/ANALISTA/PT), `soa_ia.status` (NA/FILA/PROCESSANDO/CONCLUIDO/FALHA/TIMEOUT/REMANENTE), `analise_feedback.sentimento` (POSITIVO/NEUTRO/NEGATIVO) |
+| **ENUM** | `usuario.papel` (ADMIN/ANALYST), `soa_ia.status` (NA/FILA/PROCESSANDO/CONCLUIDO/FALHA/TIMEOUT/REMANENTE), `analise_feedback.sentimento` (POSITIVO/NEUTRO/NEGATIVO) |
 
 ### Verificar banco criado
 
@@ -227,13 +235,22 @@ python check_db.py
 |---|---|---|
 | `GET` | `/health` | `{"status": "ok", "version": "1.0.0"}` |
 
-### Usuários
+### Autenticação
+Todas as rotas, exceto `/health` e `/auth/login`, exigem o header `Authorization: Bearer <token>`.
+Cada usuário só vê as próprias conversas e gerenciações; ADMIN vê tudo.
+
 | Método | Endpoint | Body / Params | Retorna | Códigos |
 |---|---|---|---|---|
-| `POST` | `/usuarios` | `{nome, email, role}` | Usuário criado | 201, 409, 422 |
-| `GET` | `/usuarios` | `?skip=0&limit=50` | Lista de usuários | 200 |
-| `GET` | `/usuarios/{uuid}` | — | Usuário | 200, 404 |
-| `DELETE` | `/usuarios/{uuid}` | — | — | 204, 404 |
+| `POST` | `/auth/login` | `{email, senha}` | `{access_token, token_type, expires_in}` | 200, 401, 422, 429 |
+
+### Usuários (somente ADMIN)
+| Método | Endpoint | Body / Params | Retorna | Códigos |
+|---|---|---|---|---|
+| `POST` | `/usuarios` | `{nome, email, senha, papel}` | Usuário criado | 201, 401, 403, 409, 422 |
+| `GET` | `/usuarios` | `?skip=0&limit=50` | Lista de usuários | 200, 401, 403 |
+| `GET` | `/usuarios/{uuid}` | — | Usuário | 200, 401, 403, 404 |
+| `PATCH` | `/usuarios/{uuid}` | `{nome?, papel?, ativo?}` | Usuário atualizado | 200, 401, 403, 404, 409 |
+| `DELETE` | `/usuarios/{uuid}` | — | Desativa (não apaga) | 204, 401, 403, 404, 409 |
 
 ### Modelos de IA (VideoModelo)
 | Método | Endpoint | Body / Params | Retorna | Códigos |
@@ -245,8 +262,8 @@ python check_db.py
 ### Conversas
 | Método | Endpoint | Body / Params | Retorna | Códigos |
 |---|---|---|---|---|
-| `POST` | `/conversas` | `{fk_usuario, titulo, tipo_consultor, configuracoes}` | Conversa criada | 201, 422 |
-| `GET` | `/conversas` | `?fk_usuario&status&skip&limit` | Lista paginada | 200 |
+| `POST` | `/conversas` | `{titulo, tipo_consultor, configuracoes}` | Conversa criada (dono = usuário do token) | 201, 401, 422 |
+| `GET` | `/conversas` | `?fk_usuario (só ADMIN)&status&skip&limit (máx. 200)` | Lista paginada | 200, 401 |
 | `GET` | `/conversas/{uuid}` | — | Conversa | 200, 404 |
 
 ### ⭐ Consulta IA (endpoint principal)
@@ -287,8 +304,8 @@ POST /api/v1/conversas/consultar
 ### Gerenciação
 | Método | Endpoint | Body / Params | Retorna | Códigos |
 |---|---|---|---|---|
-| `POST` | `/gerenciacoes` | `{fk_pessoa, tipo_pot, fingerprint_dispositivo, credencial_ip}` | Gerenciação criada | 201, 422 |
-| `GET` | `/gerenciacoes` | `?fk_pessoa&status_filtro&skip&limit` | Lista paginada | 200 |
+| `POST` | `/gerenciacoes` | `{tipo_pot, fingerprint_dispositivo}` | Gerenciação criada (dono e IP vêm do servidor) | 201, 401, 422 |
+| `GET` | `/gerenciacoes` | `?fk_pessoa (só ADMIN)&status_filtro&skip&limit (máx. 200)` | Lista paginada | 200, 401 |
 | `GET` | `/gerenciacoes/{uuid}` | — | Gerenciação | 200, 404 |
 | `PATCH` | `/gerenciacoes/{uuid}/status` | `?novo_status=CONCLUIDO` | Atualizado | 200, 404, 422 |
 
@@ -462,23 +479,34 @@ python seed_db.py
 
 ## Exemplos com curl
 
-### Criar usuário
+### Login
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "voce@empresa.com", "senha": "uma-senha-forte-aqui"}' | jq -r .access_token)
+```
+
+### Criar usuário (ADMIN)
 ```bash
 curl -X POST http://localhost:8000/api/v1/usuarios \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"nome": "João Silva", "email": "joao@empresa.com", "role": "ANALISTA"}'
+  -d '{"nome": "João Silva", "email": "joao@empresa.com", "senha": "outra-senha-forte", "papel": "ANALYST"}'
 ```
 
 ### Criar conversa
+O dono da conversa é o usuário do token.
 ```bash
 curl -X POST http://localhost:8000/api/v1/conversas \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"fk_usuario": "<uuid-do-usuario>", "titulo": "Consultoria Financeira"}'
+  -d '{"titulo": "Consultoria Financeira"}'
 ```
 
 ### Consultar a IA
 ```bash
 curl -X POST http://localhost:8000/api/v1/conversas/consultar \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "conversa_uuid": "<uuid-da-conversa>",

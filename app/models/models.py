@@ -7,7 +7,7 @@ Convenções:
   • FKs explícitas com ondelete="CASCADE" onde faz sentido
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Enum, Float, ForeignKey,
@@ -23,7 +23,7 @@ def _uuid() -> str:
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ══════════════════════════════════════════════════════════════════

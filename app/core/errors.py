@@ -116,7 +116,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         ]
         logger.warning("Dados inválidos na requisição %s: %s", request.url.path, campos)
         return _error_response(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            422,
             "VALIDATION_ERROR",
             "Dados de entrada inválidos.",
             fields=campos,

@@ -5,7 +5,7 @@ from typing import List
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import requer_papel
+from app.api.deps import get_usuario_atual, requer_papel
 from app.core.database import get_db
 from app.core.errors import NotFoundError, ConflictError
 from app.core.security import gerar_hash_senha
@@ -170,12 +170,13 @@ def remover_usuario(
     status_code=status.HTTP_201_CREATED,
     summary="Registrar modelo de IA",
     tags=["Modelos de IA"],
+    dependencies=[Depends(requer_papel("ADMIN"))],
 )
 def criar_video_modelo(payload: VideoModeloCreate, db: Session = Depends(get_db)):
     """
     **Recebe:** provider, nome_modelo, status_ativo, is_current
     **Retorna:** modelo registrado
-    **Códigos:** 201 | 409 | 422
+    **Códigos:** 201 | 401 | 403 | 409 | 422
     """
     modelo = VideoModelo(**payload.model_dump())
     db.add(modelo)
@@ -189,6 +190,7 @@ def criar_video_modelo(payload: VideoModeloCreate, db: Session = Depends(get_db)
     response_model=List[VideoModeloResponse],
     summary="Listar modelos de IA",
     tags=["Modelos de IA"],
+    dependencies=[Depends(get_usuario_atual)],
 )
 def listar_video_modelos(db: Session = Depends(get_db)):
     """
@@ -203,11 +205,12 @@ def listar_video_modelos(db: Session = Depends(get_db)):
     response_model=VideoModeloResponse,
     summary="Definir modelo como ativo (current)",
     tags=["Modelos de IA"],
+    dependencies=[Depends(requer_papel("ADMIN"))],
 )
 def ativar_video_modelo(uuid: str, db: Session = Depends(get_db)):
     """
     Define um modelo como `is_current=True` e desativa os demais.
-    **Códigos:** 200 | 404
+    **Códigos:** 200 | 401 | 403 | 404
     """
     modelo = db.query(VideoModelo).filter(VideoModelo.uuid == uuid).first()
     if not modelo:

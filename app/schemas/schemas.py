@@ -2,6 +2,7 @@
 Schemas Pydantic — Request / Response para todos os endpoints.
 """
 from __future__ import annotations
+import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -105,16 +106,23 @@ class VideoModeloResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 
 class ConversaCreate(BaseModel):
-    fk_usuario: str
-    titulo: Optional[str] = None
-    tipo_consultor: Optional[str] = None
+    # fk_usuario não vem do cliente: é sempre o usuário logado
+    titulo: Optional[str] = Field(None, max_length=200)
+    tipo_consultor: Optional[str] = Field(None, max_length=100)
     configuracoes: Optional[Dict[str, Any]] = None
+
+    @field_validator("configuracoes")
+    @classmethod
+    def configuracoes_pequenas(cls, v):
+        if v is not None and len(json.dumps(v)) > 10_000:
+            raise ValueError("configuracoes muito grande (máx. 10.000 caracteres em JSON).")
+        return v
 
 class MensagemInput(BaseModel):
     """Mensagem enviada pelo usuário dentro de uma conversa."""
-    conversa_uuid: str
+    conversa_uuid: str = Field(..., max_length=36)
     mensagem: str = Field(..., min_length=1, max_length=10000)
-    tipo_consultor: Optional[str] = None
+    tipo_consultor: Optional[str] = Field(None, max_length=100)
 
     @field_validator("mensagem")
     @classmethod
@@ -140,10 +148,9 @@ class ConversaResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 
 class GerenciacaoCreate(BaseModel):
-    fk_pessoa: str
-    tipo_pot: Optional[str] = None
-    fingerprint_dispositivo: Optional[str] = None
-    credencial_ip: Optional[str] = None
+    # fk_pessoa e credencial_ip não vêm do cliente: saem do login e da conexão
+    tipo_pot: Optional[str] = Field(None, max_length=50)
+    fingerprint_dispositivo: Optional[str] = Field(None, max_length=255)
 
 class GerenciacaoResponse(BaseModel):
     uuid: str
@@ -176,9 +183,9 @@ class SoaIaResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 
 class AnaliseFeedbackCreate(BaseModel):
-    fk_gerenciacao: str
-    fk_video_modelo: Optional[str] = None
-    texto_para_analisar: str = Field(..., min_length=5)
+    fk_gerenciacao: str = Field(..., max_length=36)
+    fk_video_modelo: Optional[str] = Field(None, max_length=36)
+    texto_para_analisar: str = Field(..., min_length=5, max_length=2000)
 
 class AnaliseFeedbackResponse(BaseModel):
     uuid: str
@@ -199,11 +206,11 @@ class AnaliseFeedbackResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 
 class LoaPunicaoCreate(BaseModel):
-    fk_conversa_set: str
+    fk_conversa_set: str = Field(..., max_length=36)
     tipo: str = Field(..., max_length=50)
     boolean_status: bool = False
     valor: Optional[float] = None
-    metodo_ativo: Optional[str] = None
+    metodo_ativo: Optional[str] = Field(None, max_length=100)
 
 class LoaPunicaoResponse(BaseModel):
     uuid: str
@@ -221,10 +228,10 @@ class LoaPunicaoResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 
 class PromptCreate(BaseModel):
-    fk_video_modelo: str
-    conteudo: str = Field(..., min_length=10)
-    contexto: Optional[str] = None
-    prompt_engenharia_template: Optional[str] = None
+    fk_video_modelo: str = Field(..., max_length=36)
+    conteudo: str = Field(..., min_length=10, max_length=20000)
+    contexto: Optional[str] = Field(None, max_length=5000)
+    prompt_engenharia_template: Optional[str] = Field(None, max_length=20000)
     status_ativo: bool = True
 
 class PromptResponse(BaseModel):
