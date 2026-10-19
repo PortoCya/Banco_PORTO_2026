@@ -1,7 +1,6 @@
 """
 Configurações da aplicação via variáveis de ambiente (Pydantic Settings).
 """
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
@@ -19,26 +18,16 @@ class Settings(BaseSettings):
     DB_ECHO: bool = False          # True → loga SQL no console
 
     # ── Segurança ────────────────────────────────────────────────────────────
-    # Sem valor padrão: a aplicação não sobe sem SECRET_KEY no ambiente.
-    # Gere com: openssl rand -hex 32
-    SECRET_KEY: str = Field(..., min_length=32)
+    SECRET_KEY: str = "TROQUE_ESTA_CHAVE_EM_PRODUCAO"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     ALGORITHM: str = "HS256"
 
-    # ── Rate limit do login (janela deslizante) ──────────────────────────────
-    LOGIN_JANELA_SEGUNDOS: int = 900          # 15 min
-    LOGIN_MAX_TENTATIVAS_IP: int = 20         # qualquer tentativa, por IP
-    LOGIN_MAX_FALHAS_EMAIL: int = 5           # só falhas, por e-mail
+    # ── IA (Google Gemini / OpenAI) ──────────────────────────────────────────
+    AI_PROVIDER: str = "gemini"    # "gemini" (gratuito) ou "openai"
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-    # ── CORS ─────────────────────────────────────────────────────────────────
-    # Lista separada por vírgula. Nunca "*" junto com credenciais.
-    CORS_ORIGINS: str = "http://localhost:3000"
-
-    @property
-    def cors_origins(self) -> list[str]:
-        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
-
-    # ── IA / OpenAI ──────────────────────────────────────────────────────────
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o"
     OPENAI_TIMEOUT_SECONDS: int = 30
