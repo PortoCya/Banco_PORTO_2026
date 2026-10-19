@@ -1,19 +1,11 @@
-"""
-Lista as tabelas do banco e quantas linhas cada uma tem.
-Execute: python check_db.py
-"""
-from dotenv import load_dotenv
-from sqlalchemy import func, inspect, select, table
-
-load_dotenv()
-
-from app.core.database import engine  # noqa: E402 — depende do .env carregado
-
-insp = inspect(engine)
-tabelas = sorted(insp.get_table_names())
-with engine.connect() as conn:
-    for nome in tabelas:
-        # table() faz o quoting do nome; nada de SQL montado com f-string
-        count = conn.execute(select(func.count()).select_from(table(nome))).scalar_one()
-        print(f"  [OK] {nome:40s} ({count} rows)")
-print(f"\n{len(tabelas)} tabelas encontradas.")
+import sqlite3
+conn = sqlite3.connect("ai_consulting.db")
+cur = conn.cursor()
+cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+tables = cur.fetchall()
+for t in tables:
+    cur.execute(f"SELECT COUNT(*) FROM {t[0]}")
+    count = cur.fetchone()[0]
+    print(f"  [OK] {t[0]:40s} ({count} rows)")
+print(f"\n{len(tables)} tabelas criadas com sucesso!")
+conn.close()
