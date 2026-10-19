@@ -1,20 +1,14 @@
 """
-Modelos SQLAlchemy — todas as 16 entidades do diagrama.
-
-Convenções:
-  • uuid4 como PK (String 36) para portabilidade entre SGBDs
-  • created_at / updated_at preenchidos automaticamente
-  • FKs explícitas com ondelete="CASCADE" onde faz sentido
+Modelos ORM SQLAlchemy — NPS KeyCore v1.0 (16 entidades fiéis ao diagrama ER e ao PRD).
+Inclui Constraints de integridade, índices de performance e campos de segurança/LGPD.
 """
 import uuid
-from datetime import datetime, timezone
-
+from datetime import datetime, date
 from sqlalchemy import (
-    Boolean, Column, DateTime, Enum, Float, ForeignKey,
-    Integer, String, Text, JSON
+    Column, String, Text, Integer, Float, Boolean, Numeric,
+    DateTime, Date, ForeignKey, Enum, JSON, CheckConstraint, Index
 )
 from sqlalchemy.orm import relationship
-
 from app.core.database import Base
 
 
@@ -23,319 +17,336 @@ def _uuid() -> str:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.utcnow()
 
 
 # ══════════════════════════════════════════════════════════════════
-# 1. VIDEO_MODELO
-# ══════════════════════════════════════════════════════════════════
-class VideoModelo(Base):
-    __tablename__ = "video_modelo"
-
-    uuid        = Column(String(36), primary_key=True, default=_uuid)
-    provider    = Column(String(100), nullable=False)          # ex: OpenAI, Anthropic
-    nome_modelo = Column(String(100), nullable=False)
-    status_ativo = Column(Boolean, default=True)
-    is_current  = Column(Boolean, default=False)
-    created_at  = Column(DateTime, default=_now)
-
-    # Relacionamentos reversos
-    tutores     = relationship("TutorCircuitoTreinado", back_populates="video_modelo")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 2. TUTOR_CIRCUITO_TREINADO
-# ══════════════════════════════════════════════════════════════════
-class TutorCircuitoTreinado(Base):
-    __tablename__ = "tutor_circuito_treinado"
-
-    uuid                = Column(String(36), primary_key=True, default=_uuid)
-    fk_video_modelo     = Column(String(36), ForeignKey("video_modelo.uuid", ondelete="SET NULL"), nullable=True)
-    rodadas_benchmarks  = Column(Integer, default=0)
-    document_base       = Column(Text)                          # path/URL do documento base
-    base_train_pipeline = Column(Text)                          # pipeline de treino
-    analise             = Column(Text)
-    created_at          = Column(DateTime, default=_now)
-
-    # Relacionamentos
-    video_modelo        = relationship("VideoModelo", back_populates="tutores")
-    configurar_sets     = relationship("ConfigurarCircuitoSet", back_populates="tutor")
-    avaliacao_sets      = relationship("AvaliacaoCircuitoSet", back_populates="tutor")
-    prompts             = relationship("Prompt", back_populates="tutor")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 3. TEMPLATE_ELEMENTOS
-# ══════════════════════════════════════════════════════════════════
-class TemplateElementos(Base):
-    __tablename__ = "template_elementos"
-
-    uuid              = Column(String(36), primary_key=True, default=_uuid)
-    nome_area         = Column(String(200))
-    balance_pdf_src   = Column(Text)                            # caminho/URL do PDF
-    template_para_3   = Column(String(100))                     # referência ao template
-    get_dimensionamento_kpis = Column(Text)
-    modelo_agr        = Column(String(200))
-    status_circuito_treinado = Column(String(50))
-
-    # Sem FK direta no diagrama; referenciado via TutorCircuitoTreinado
-    tutores_config    = relationship("ConfigurarCircuitoSet", back_populates="template")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 4. AVALIACAO_CIRCUITO_SET
-# ══════════════════════════════════════════════════════════════════
-class AvaliacaoCircuitoSet(Base):
-    __tablename__ = "avaliacao_circuito_set"
-
-    uuid                = Column(String(36), primary_key=True, default=_uuid)
-    fk_video_modelo     = Column(String(36), ForeignKey("tutor_circuito_treinado.uuid", ondelete="CASCADE"))
-    rodadas_benchmarks  = Column(Integer, default=0)
-    document_base       = Column(Text)
-    base_train_pipeline = Column(Text)
-    analise             = Column(Text)
-    created_at          = Column(DateTime, default=_now)
-
-    tutor               = relationship("TutorCircuitoTreinado", back_populates="avaliacao_sets")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 5. PROMPT
-# ══════════════════════════════════════════════════════════════════
-class Prompt(Base):
-    __tablename__ = "prompt"
-
-    uuid            = Column(String(36), primary_key=True, default=_uuid)
-    conteudo        = Column(Text, nullable=False)              # texto do prompt
-    contexto        = Column(Text)
-    fk_video_modelo = Column(String(36), ForeignKey("tutor_circuito_treinado.uuid", ondelete="CASCADE"))
-    prompt_engenharia_template = Column(Text)
-    status_ativo    = Column(Boolean, default=True)
-
-    tutor           = relationship("TutorCircuitoTreinado", back_populates="prompts")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 6. CONFIGURAR_CIRCUITO_SET
-# ══════════════════════════════════════════════════════════════════
-class ConfigurarCircuitoSet(Base):
-    __tablename__ = "configurar_circuito_set"
-
-    uuid                        = Column(String(36), primary_key=True, default=_uuid)
-    fk_tutor                    = Column(String(36), ForeignKey("tutor_circuito_treinado.uuid", ondelete="CASCADE"))
-    fk_template                 = Column(String(36), ForeignKey("template_elementos.uuid", ondelete="SET NULL"), nullable=True)
-    status_certifica_humanizado  = Column(String(50))
-    status_certifica_humanizado2 = Column(String(50))
-    forma_reposta_elementos     = Column(Text)
-    created_at                  = Column(DateTime, default=_now)
-
-    tutor    = relationship("TutorCircuitoTreinado", back_populates="configurar_sets")
-    template = relationship("TemplateElementos", back_populates="tutores_config")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 7. USUARIO (EQUIPO)
+# 1. USUARIO (Administração e RBAC: ADMIN | ANALYST)
 # ══════════════════════════════════════════════════════════════════
 class Usuario(Base):
     __tablename__ = "usuario"
 
-    uuid       = Column(String(36), primary_key=True, default=_uuid)
-    nome       = Column(String(200), nullable=False)
-    email      = Column(String(200), unique=True, nullable=False, index=True)  # sempre minúsculo
-    senha_hash = Column(String(255), nullable=False)                           # Argon2id
-    papel      = Column(Enum("ADMIN", "ANALYST", name="papel_enum"), nullable=False, default="ANALYST")
-    ativo      = Column(Boolean, nullable=False, default=True)
-    criado_em  = Column(DateTime, default=_now)
+    id          = Column(String(36), primary_key=True, default=_uuid)
+    nome        = Column(String(200), nullable=False)
+    email       = Column(String(255), nullable=False, unique=True, index=True)
+    senha_hash  = Column(String(255), nullable=False)
+    papel       = Column(Enum("ADMIN", "ANALYST", name="papel_usuario_enum"), nullable=False, default="ANALYST")
+    ativo       = Column(Boolean, nullable=False, default=True)
+    criado_em   = Column(DateTime, nullable=False, default=_now)
 
-    conversas  = relationship("Conversa", back_populates="usuario")
-    gerenciacoes = relationship("Gerenciacao", back_populates="usuario")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 8. CONVERSA
-# ══════════════════════════════════════════════════════════════════
-class Conversa(Base):
-    __tablename__ = "conversa"
-
-    uuid              = Column(String(36), primary_key=True, default=_uuid)
-    fk_usuario        = Column(String(36), ForeignKey("usuario.uuid", ondelete="CASCADE"))
-    titulo            = Column(String(300))
-    tipo_consultor    = Column(String(50))                     # personagem IA ativo
-    status            = Column(String(30), default="aberta")
-    configuracoes     = Column(JSON)                           # ajustes da sessão
-    created_at        = Column(DateTime, default=_now)
-    updated_at        = Column(DateTime, default=_now, onupdate=_now)
-
-    usuario           = relationship("Usuario", back_populates="conversas")
-    loa_punicoes      = relationship("LoaPunicao", back_populates="conversa")
+    pesquisas_criadas = relationship("Pesquisa", back_populates="criador")
+    logs_auditoria    = relationship("LogAuditoria", back_populates="usuario_ator")
+    logs_exportacao   = relationship("LogExportacao", back_populates="analista")
+    rotulos_golden    = relationship("RotuloGoldenSet", back_populates="rotulador")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. LOA_PUNICAO  (atributos da requisição de IA)
+# 2. PESQUISA (Com auto-referência para versionamento sem perder histórico - RF-004)
 # ══════════════════════════════════════════════════════════════════
-class LoaPunicao(Base):
-    __tablename__ = "loa_punicao"
+class Pesquisa(Base):
+    __tablename__ = "pesquisa"
 
-    uuid             = Column(String(36), primary_key=True, default=_uuid)
-    fk_conversa_set  = Column(String(36), ForeignKey("conversa.uuid", ondelete="CASCADE"))
-    tipo             = Column(String(50))                      # tipo_atributo
-    boolean_status   = Column(Boolean, default=False)
-    valor            = Column(Float)
-    metodo_ativo     = Column(String(100))
-    created_at       = Column(DateTime, default=_now)
-
-    conversa         = relationship("Conversa", back_populates="loa_punicoes")
-    matriz_punicoes  = relationship("MatrizPunicaoSet", back_populates="loa_punicao")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 10. MATRIZ_PUNICAO_SET
-# ══════════════════════════════════════════════════════════════════
-class MatrizPunicaoSet(Base):
-    __tablename__ = "matriz_punicao_set"
-
-    uuid              = Column(String(36), primary_key=True, default=_uuid)
-    fk_loa_punicao    = Column(String(36), ForeignKey("loa_punicao.uuid", ondelete="CASCADE"))
-    fk_kpis_pot       = Column(String(36))                     # FK opcional para dimensoes_kpis
-    boolean_relevante = Column(Boolean, default=False)
-    nota_pot          = Column(Float)
-    nota_relevancia   = Column(Float)
-    get_pontuacao     = Column(Float)                          # calculado
-    get_pontuacao2    = Column(Float)
-    created_at        = Column(DateTime, default=_now)
-
-    loa_punicao       = relationship("LoaPunicao", back_populates="matriz_punicoes")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 11. LINHA_RACIOCINIO
-# ══════════════════════════════════════════════════════════════════
-class LinhaRaciocinio(Base):
-    __tablename__ = "linha_raciocinio"
-
-    uuid          = Column(String(36), primary_key=True, default=_uuid)
-    fk_gerencia   = Column(String(36), ForeignKey("gerenciacao.uuid", ondelete="CASCADE"))
-    nome          = Column(String(200))
-    trace         = Column(Text)                              # log da linha de raciocínio IA
-    status        = Column(String(50))
-    created_at    = Column(DateTime, default=_now)
-    created_at2   = Column(DateTime)
-
-    gerenciacao   = relationship("Gerenciacao", back_populates="linhas_raciocinio")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 12. DIMENSOES_KPIS
-# ══════════════════════════════════════════════════════════════════
-class DimensoesKpis(Base):
-    __tablename__ = "dimensoes_kpis"
-
-    uuid             = Column(String(36), primary_key=True, default=_uuid)
-    fk_gerencia      = Column(String(36), ForeignKey("gerenciacao.uuid", ondelete="CASCADE"))
-    data             = Column(DateTime, default=_now)
-    periodo_fim      = Column(DateTime)
-    valor_pot        = Column(Float)                          # 100 + 1.1% remunerado
-    get_pontuacoes   = Column(Float)
-    get_pontuacoes2  = Column(Float)
-    created_at       = Column(DateTime, default=_now)
-
-    gerenciacao      = relationship("Gerenciacao", back_populates="dimensoes_kpis")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 13. LOG_DIRECIONAR
-# ══════════════════════════════════════════════════════════════════
-class LogDirecionar(Base):
-    __tablename__ = "log_direcionar"
-
-    uuid             = Column(String(36), primary_key=True, default=_uuid)
-    fk_usuario       = Column(String(36), ForeignKey("usuario.uuid", ondelete="CASCADE"))
-    fk_associacao    = Column(String(36), ForeignKey("gerenciacao.uuid", ondelete="SET NULL"), nullable=True)
-    destino_associado = Column(String(200))
-    boolean_status   = Column(Boolean, default=False)
-    created_at       = Column(DateTime, default=_now)
-
-    gerenciacao      = relationship("Gerenciacao", back_populates="logs_direcionar")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 14. GERENCIACAO
-# ══════════════════════════════════════════════════════════════════
-class Gerenciacao(Base):
-    __tablename__ = "gerenciacao"
-
-    uuid               = Column(String(36), primary_key=True, default=_uuid)
-    fk_pessoa          = Column(String(36), ForeignKey("usuario.uuid", ondelete="CASCADE"))
-    fk_loa_punicao     = Column(String(36), ForeignKey("loa_punicao.uuid", ondelete="SET NULL"), nullable=True)
-    tipo_pot           = Column(String(50))                   # O/N/Q base primário
-    tempo_gerenciacao  = Column(DateTime)
-    chave_referencia   = Column(String(200), unique=True, index=True)  # UK
-    fingerprint_dispositivo = Column(String(500))
-    credencial_ip      = Column(String(50))
-    status             = Column(String(50))                   # ABERTO/PROCESSANDO/CONCLUIDO/FALHA/PENDENTE
-    status_associacao  = Column(String(50))
-    created_at         = Column(DateTime, default=_now)
-
-    # Relacionamentos
-    usuario            = relationship("Usuario", back_populates="gerenciacoes")
-    linhas_raciocinio  = relationship("LinhaRaciocinio", back_populates="gerenciacao")
-    dimensoes_kpis     = relationship("DimensoesKpis", back_populates="gerenciacao")
-    logs_direcionar    = relationship("LogDirecionar", back_populates="gerenciacao")
-    soa_ia             = relationship("SoaIa", back_populates="gerenciacao", uselist=False)
-    analises_feedback  = relationship("AnaliseFeedback", back_populates="gerenciacao")
-
-
-# ══════════════════════════════════════════════════════════════════
-# 15. SOA_IA  (orquestrador de chamadas IA)
-# ══════════════════════════════════════════════════════════════════
-class SoaIa(Base):
-    __tablename__ = "soa_ia"
-
-    uuid             = Column(String(36), primary_key=True, default=_uuid)
-    fk_gerenciacao   = Column(String(36), ForeignKey("gerenciacao.uuid", ondelete="CASCADE"), unique=True)
-    status           = Column(
-        Enum("NA", "FILA", "PROCESSANDO", "CONCLUIDO", "FALHA", "TIMEOUT", "REMANENTE", name="soa_status_enum"),
-        default="NA"
+    id                    = Column(String(36), primary_key=True, default=_uuid)
+    titulo                = Column(String(300), nullable=False)
+    texto_pergunta_nps    = Column(Text, nullable=False)
+    texto_pergunta_aberta = Column(Text, nullable=True)
+    status                = Column(
+        Enum("RASCUNHO", "PUBLICADA", "PAUSADA", "ARQUIVADA", name="status_pesquisa_enum"),
+        nullable=False,
+        default="RASCUNHO",
+        index=True,
     )
-    allow_queue      = Column(Boolean, default=True)
-    created_at       = Column(DateTime, default=_now)
-    updated_at       = Column(DateTime, default=_now, onupdate=_now)
-    created_at2      = Column(DateTime)
+    numero_versao         = Column(Integer, nullable=False, default=1)
+    id_pesquisa_pai       = Column(String(36), ForeignKey("pesquisa.uuid" if False else "pesquisa.id", ondelete="SET NULL"), nullable=True)
+    criado_por            = Column(String(36), ForeignKey("usuario.id", ondelete="RESTRICT"), nullable=False)
+    criada_em             = Column(DateTime, nullable=False, default=_now)
+    atualizada_em         = Column(DateTime, nullable=False, default=_now, onupdate=_now)
 
-    gerenciacao      = relationship("Gerenciacao", back_populates="soa_ia")
+    criador               = relationship("Usuario", back_populates="pesquisas_criadas")
+    pesquisa_pai          = relationship("Pesquisa", remote_side=[id], backref="versoes_filhas")
+    links                 = relationship("LinkPesquisa", back_populates="pesquisa", cascade="all, delete-orphan")
+    submissoes            = relationship("Submissao", back_populates="pesquisa")
+    snapshots_nps         = relationship("SnapshotNps", back_populates="pesquisa", cascade="all, delete-orphan")
+    logs_exportacao       = relationship("LogExportacao", back_populates="pesquisa")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 16. ANALISE_FEEDBACK
+# 3. LINK_PESQUISA (Tokens NOMINAL de uso único ou ABERTO - RF-005, RF-009, RF-012)
+# ══════════════════════════════════════════════════════════════════
+class LinkPesquisa(Base):
+    __tablename__ = "link_pesquisa"
+
+    id          = Column(String(36), primary_key=True, default=_uuid)
+    id_pesquisa = Column(String(36), ForeignKey("pesquisa.id", ondelete="CASCADE"), nullable=False, index=True)
+    tipo        = Column(Enum("NOMINAL", "ABERTO", name="tipo_link_enum"), nullable=False, default="ABERTO")
+    token       = Column(String(128), nullable=False, unique=True, index=True)
+    usado_em    = Column(DateTime, nullable=True)   # nulo até a 1ª submissão (bloqueia reuso em NOMINAL)
+    criado_em   = Column(DateTime, nullable=False, default=_now)
+
+    pesquisa    = relationship("Pesquisa", back_populates="links")
+    submissoes  = relationship("Submissao", back_populates="link_pesquisa")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4. SUBMISSAO (Dado primário imutável, nota NPS 0-10, antiduplicidade e LGPD)
+# ══════════════════════════════════════════════════════════════════
+class Submissao(Base):
+    __tablename__ = "submissao"
+    __table_args__ = (
+        CheckConstraint("nota_nps >= 0 AND nota_nps <= 10", name="ck_submissao_nota_nps_0_10"),
+        Index("ix_submissao_pesquisa_criada", "id_pesquisa", "criada_em"),
+    )
+
+    id                      = Column(String(36), primary_key=True, default=_uuid)
+    id_pesquisa             = Column(String(36), ForeignKey("pesquisa.id", ondelete="RESTRICT"), nullable=False)
+    id_link_pesquisa        = Column(String(36), ForeignKey("link_pesquisa.id", ondelete="SET NULL"), nullable=True)
+    nota_nps                = Column(Integer, nullable=False)       # 0 a 10, dado primário determinístico
+    texto_comentario        = Column(Text, nullable=True)           # íntegro na base interna
+    chave_idempotencia      = Column(String(128), nullable=False, unique=True, index=True)
+    fingerprint_dispositivo = Column(String(255), nullable=True)
+    endereco_ip             = Column(String(128), nullable=True)    # armazenado como hash SHA-256 (LGPD)
+    status                  = Column(
+        Enum("VALIDA", "BLOQUEADA_DUPLICIDADE", name="status_submissao_enum"),
+        nullable=False,
+        default="VALIDA",
+    )
+    status_mascaramento_pii = Column(
+        Enum("NAO_APLICAVEL", "MASCARADO", "FALHA_MASCARAMENTO_PII", name="status_pii_enum"),
+        nullable=False,
+        default="NAO_APLICAVEL",
+    )
+    criada_em               = Column(DateTime, nullable=False, default=_now)
+
+    pesquisa                = relationship("Pesquisa", back_populates="submissoes")
+    link_pesquisa           = relationship("LinkPesquisa", back_populates="submissoes")
+    jobs_ia                 = relationship("JobIa", back_populates="submissao", cascade="all, delete-orphan")
+    analises_feedback       = relationship("AnaliseFeedback", back_populates="submissao", cascade="all, delete-orphan")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5. SNAPSHOT_NPS (Cálculo determinístico: %Promotores - %Detratores, -100 a +100)
+# ══════════════════════════════════════════════════════════════════
+class SnapshotNps(Base):
+    __tablename__ = "snapshot_nps"
+    __table_args__ = (
+        CheckConstraint("valor_nps >= -100 AND valor_nps <= 100", name="ck_snapshot_valor_nps"),
+    )
+
+    id              = Column(String(36), primary_key=True, default=_uuid)
+    id_pesquisa     = Column(String(36), ForeignKey("pesquisa.id", ondelete="CASCADE"), nullable=False, index=True)
+    periodo_inicio  = Column(Date, nullable=False, default=date.today)
+    periodo_fim     = Column(Date, nullable=False, default=date.today)
+    valor_nps       = Column(Integer, nullable=False)               # -100 a +100, recalculável
+    total_respostas = Column(Integer, nullable=False, default=0)
+    qtd_promotores  = Column(Integer, nullable=False, default=0)    # notas 9 e 10
+    qtd_neutros     = Column(Integer, nullable=False, default=0)    # notas 7 e 8
+    qtd_detratores  = Column(Integer, nullable=False, default=0)    # notas 0 a 6
+    calculado_em    = Column(DateTime, nullable=False, default=_now)
+
+    pesquisa        = relationship("Pesquisa", back_populates="snapshots_nps")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6. PROMPT (Engenharia de prompt para análise qualitativa)
+# ══════════════════════════════════════════════════════════════════
+class Prompt(Base):
+    __tablename__ = "prompt"
+
+    id                    = Column(String(36), primary_key=True, default=_uuid)
+    objetivo              = Column(Text, nullable=False)
+    contexto              = Column(Text, nullable=False)
+    saida_esperada        = Column(Text, nullable=False)
+    problemas_encontrados = Column(Text, nullable=True)
+    criado_em             = Column(DateTime, nullable=False, default=_now)
+
+    versoes_modelo        = relationship("VersaoModelo", back_populates="prompt")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 7. VERSAO_MODELO (Registro e governança de modelos LLM)
+# ══════════════════════════════════════════════════════════════════
+class VersaoModelo(Base):
+    __tablename__ = "versao_modelo"
+
+    id            = Column(String(36), primary_key=True, default=_uuid)
+    provedor      = Column(String(100), nullable=False)             # Google Gemini, OpenAI, etc.
+    nome_modelo   = Column(String(100), nullable=False)             # gemini-2.0-flash, gpt-4o, etc.
+    rotulo_versao = Column(String(100), nullable=False, unique=True)
+    id_prompt     = Column(String(36), ForeignKey("prompt.id", ondelete="RESTRICT"), nullable=False)
+    ativa         = Column(Boolean, nullable=False, default=True, index=True)
+    promovida_em  = Column(DateTime, nullable=True, default=_now)
+
+    prompt            = relationship("Prompt", back_populates="versoes_modelo")
+    avaliacoes_golden = relationship("AvaliacaoGoldenSet", back_populates="versao_modelo", cascade="all, delete-orphan")
+    analises_feedback = relationship("AnaliseFeedback", back_populates="versao_modelo")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 8. JOB_IA (Fila assíncrona desacoplada — falha nunca bloqueia Submissao)
+# ══════════════════════════════════════════════════════════════════
+class JobIa(Base):
+    __tablename__ = "job_ia"
+
+    id                   = Column(String(36), primary_key=True, default=_uuid)
+    id_submissao         = Column(String(36), ForeignKey("submissao.id", ondelete="CASCADE"), nullable=False, index=True)
+    status               = Column(
+        Enum("NA_FILA", "PROCESSANDO", "CONCLUIDO", "FALHOU", "TENTANDO_NOVAMENTE", name="status_job_ia_enum"),
+        nullable=False,
+        default="NA_FILA",
+        index=True,
+    )
+    tentativas           = Column(Integer, nullable=False, default=0)
+    ultimo_erro          = Column(String(500), nullable=True)
+    proxima_tentativa_em = Column(DateTime, nullable=True)
+    criado_em            = Column(DateTime, nullable=False, default=_now)
+
+    submissao            = relationship("Submissao", back_populates="jobs_ia")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 9. ANALISE_FEEDBACK (Camada derivada da IA — não altera resposta original)
 # ══════════════════════════════════════════════════════════════════
 class AnaliseFeedback(Base):
     __tablename__ = "analise_feedback"
+    __table_args__ = (
+        CheckConstraint("confianca >= 0.0 AND confianca <= 1.0", name="ck_analise_confianca_0_1"),
+    )
 
-    uuid               = Column(String(36), primary_key=True, default=_uuid)
-    fk_gerenciacao     = Column(String(36), ForeignKey("gerenciacao.uuid", ondelete="CASCADE"))
-    fk_video_modelo    = Column(String(36), ForeignKey("video_modelo.uuid", ondelete="SET NULL"), nullable=True)
-    sentimento         = Column(Enum("POSITIVO", "NEUTRO", "NEGATIVO", name="sentimento_enum"))
-    tema               = Column(String(200))
-    confianca          = Column(Float)                        # 0.0–1.0
-    justificativa      = Column(Text)
-    sugestoes_acao     = Column(JSON)                         # lista de ações sugeridas pela IA
-    status             = Column(String(50))
-    created_at         = Column(DateTime, default=_now)
+    id               = Column(String(36), primary_key=True, default=_uuid)
+    id_submissao     = Column(String(36), ForeignKey("submissao.id", ondelete="CASCADE"), nullable=False, index=True)
+    id_versao_modelo = Column(String(36), ForeignKey("versao_modelo.id", ondelete="RESTRICT"), nullable=False)
+    sentimento       = Column(Enum("POSITIVO", "NEUTRO", "NEGATIVO", name="sentimento_enum"), nullable=False)
+    tema             = Column(String(200), nullable=False)          # taxonomia fechada
+    confianca        = Column(Float, nullable=False)                # 0.0 a 1.0
+    justificativa    = Column(Text, nullable=True)
+    sequencia_versao = Column(Integer, nullable=False, default=1)   # reprocessamento gera nova versão
+    status           = Column(
+        Enum(
+            "PENDENTE", "CONCLUIDA", "FALHA_SCHEMA",
+            "DESCARTADA_PARCIAL", "BAIXA_CONFIANCA",
+            name="status_analise_feedback_enum"
+        ),
+        nullable=False,
+        default="CONCLUIDA",
+    )
+    criada_em        = Column(DateTime, nullable=False, default=_now)
+    atualizada_em    = Column(DateTime, nullable=False, default=_now, onupdate=_now)
 
-    gerenciacao        = relationship("Gerenciacao", back_populates="analises_feedback")
+    submissao        = relationship("Submissao", back_populates="analises_feedback")
+    versao_modelo    = relationship("VersaoModelo", back_populates="analises_feedback")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 17. LOG_AUDITORIA
+# 10. AVALIACAO_GOLDEN_SET (Benchmark de qualidade do modelo de IA)
+# ══════════════════════════════════════════════════════════════════
+class AvaliacaoGoldenSet(Base):
+    __tablename__ = "avaliacao_golden_set"
+
+    id                  = Column(String(36), primary_key=True, default=_uuid)
+    id_versao_modelo    = Column(String(36), ForeignKey("versao_modelo.id", ondelete="CASCADE"), nullable=False)
+    acuracia_sentimento = Column(Numeric(5, 4), nullable=False)
+    acuracia_tema       = Column(Numeric(5, 4), nullable=False)
+    taxa_falso_positivo = Column(Numeric(5, 4), nullable=False)
+    status              = Column(Enum("APROVADO", "REPROVADO", name="status_golden_enum"), nullable=False)
+    executada_em        = Column(DateTime, nullable=False, default=_now)
+
+    versao_modelo       = relationship("VersaoModelo", back_populates="avaliacoes_golden")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 11. COMENTARIO_GOLDEN_SET (Dataset padrão-ouro para calibração da IA)
+# ══════════════════════════════════════════════════════════════════
+class ComentarioGoldenSet(Base):
+    __tablename__ = "comentario_golden_set"
+
+    id                       = Column(String(36), primary_key=True, default=_uuid)
+    texto_comentario         = Column(Text, nullable=False)
+    rotulo_sentimento_humano = Column(String(50), nullable=False)
+    rotulo_tema_humano       = Column(String(100), nullable=False)
+    criado_em                = Column(DateTime, nullable=False, default=_now)
+
+    rotulos                  = relationship("RotuloGoldenSet", back_populates="comentario_golden", cascade="all, delete-orphan")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 12. ROTULO_GOLDEN_SET (Rotulagem dupla + desempate por analistas)
+# ══════════════════════════════════════════════════════════════════
+class RotuloGoldenSet(Base):
+    __tablename__ = "rotulo_golden_set"
+
+    id                       = Column(String(36), primary_key=True, default=_uuid)
+    id_comentario_golden_set = Column(String(36), ForeignKey("comentario_golden_set.id", ondelete="CASCADE"), nullable=False)
+    rotulado_por             = Column(String(36), ForeignKey("usuario.id", ondelete="RESTRICT"), nullable=False)
+    eh_desempate             = Column(Boolean, nullable=False, default=False)
+    rotulo_sentimento        = Column(String(50), nullable=False)
+    rotulo_tema              = Column(String(100), nullable=False)
+
+    comentario_golden        = relationship("ComentarioGoldenSet", back_populates="rotulos")
+    rotulador                = relationship("Usuario", back_populates="rotulos_golden")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 13. LOG_AUDITORIA (Trilha imutável de ações críticas - RF-020 / LGPD)
 # ══════════════════════════════════════════════════════════════════
 class LogAuditoria(Base):
     __tablename__ = "log_auditoria"
 
-    id               = Column(String(36), primary_key=True, default=_uuid)
-    id_usuario_ator  = Column(String(36), ForeignKey("usuario.uuid"), nullable=False)
-    acao             = Column(String(100), nullable=False)
-    tipo_entidade    = Column(String(100), nullable=False)
-    id_entidade      = Column(String(36), nullable=False)
-    estado_antes     = Column(JSON, nullable=True)
-    estado_depois    = Column(JSON, nullable=True)
-    criado_em        = Column(DateTime, default=_now)
+    id              = Column(String(36), primary_key=True, default=_uuid)
+    id_usuario_ator = Column(String(36), ForeignKey("usuario.id", ondelete="SET NULL"), nullable=True, index=True)
+    acao            = Column(String(150), nullable=False, index=True)
+    tipo_entidade   = Column(String(100), nullable=False)
+    id_entidade     = Column(String(36), nullable=False)
+    estado_antes    = Column(JSON, nullable=True)
+    estado_depois   = Column(JSON, nullable=True)
+    criado_em       = Column(DateTime, nullable=False, default=_now, index=True)
+
+    usuario_ator    = relationship("Usuario", back_populates="logs_auditoria")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 14. LOG_EXPORTACAO (Governança LGPD de exportações CSV - Pág. 9 PRD)
+# ══════════════════════════════════════════════════════════════════
+class LogExportacao(Base):
+    __tablename__ = "log_exportacao"
+
+    id                = Column(String(36), primary_key=True, default=_uuid)
+    id_analista       = Column(String(36), ForeignKey("usuario.id", ondelete="RESTRICT"), nullable=False, index=True)
+    id_pesquisa       = Column(String(36), ForeignKey("pesquisa.id", ondelete="RESTRICT"), nullable=False, index=True)
+    campos_exportados = Column(String(500), nullable=False)
+    anonimizado       = Column(Boolean, nullable=False, default=True)
+    criado_em         = Column(DateTime, nullable=False, default=_now)
+
+    analista          = relationship("Usuario", back_populates="logs_exportacao")
+    pesquisa          = relationship("Pesquisa", back_populates="logs_exportacao")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 15. EVENTO_CIRCUIT_BREAKER (Proteção financeira e operacional de IA)
+# ══════════════════════════════════════════════════════════════════
+class EventoCircuitBreaker(Base):
+    __tablename__ = "evento_circuit_breaker"
+
+    id              = Column(String(36), primary_key=True, default=_uuid)
+    motivo          = Column(String(300), nullable=False)
+    custo_acumulado = Column(Numeric(10, 4), nullable=False, default=0)
+    limite_custo    = Column(Numeric(10, 4), nullable=False, default=100.0)
+    disparado_em    = Column(DateTime, nullable=False, default=_now)
+    resolvido_em    = Column(DateTime, nullable=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 16. SNAPSHOT_TELEMETRIA (Observabilidade p50, p95, 5xx, falhas PII - Pág. 9 PRD)
+# ══════════════════════════════════════════════════════════════════
+class SnapshotTelemetria(Base):
+    __tablename__ = "snapshot_telemetria"
+
+    id                          = Column(String(36), primary_key=True, default=_uuid)
+    inicio_janela               = Column(DateTime, nullable=False, default=_now)
+    fim_janela                  = Column(DateTime, nullable=False, default=_now)
+    latencia_p50_ms             = Column(Integer, nullable=False, default=0)
+    latencia_p95_ms             = Column(Integer, nullable=False, default=0)
+    taxa_erro_5xx               = Column(Numeric(5, 4), nullable=False, default=0)
+    pct_descartado_ec12         = Column(Numeric(5, 4), nullable=False, default=0)
+    pct_descartado_ec13         = Column(Numeric(5, 4), nullable=False, default=0)
+    qtd_pii_mascaramento_falhou = Column(Integer, nullable=False, default=0)
+    status_circuit_breaker      = Column(String(50), nullable=False, default="FECHADO")
