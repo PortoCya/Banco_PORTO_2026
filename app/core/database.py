@@ -58,9 +58,7 @@ def get_db():
     try:
         yield db
     except Exception as exc:
-        # Só o tipo: a mensagem pode carregar dados da requisição (ex.: senha
-        # em erro de validação). Os handlers em errors.py logam o detalhe seguro.
-        logger.error("Erro durante a sessão do banco (%s); rollback.", type(exc).__name__)
+        logger.error("Erro na sessão do banco: %s", exc)
         db.rollback()
         raise
     finally:
