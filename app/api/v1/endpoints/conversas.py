@@ -1,361 +1,527 @@
 """
-Endpoints — Conversas e consulta principal à IA.
-Fluxo: Frontend → /conversas/consultar → LOA_PUNICAO → GERENCIACAO → SOA_IA → IA → ANALISE_FEEDBACK → resposta
+Endpoints de Pesquisas (Surveys), Links (NOMINAL/ABERTO), Submissões Públicas e Exportação CSV — NPS KeyCore v1.0.
+Atende RF-003 a RF-013, RF-019 e Regras de Integridade 1 a 8 do PRD.
 """
-import logging
-import uuid as uuid_lib
-from datetime import datetime, timezone
+import csv
+import io
+import secrets
+from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, status, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import buscar_conversa_do_usuario, buscar_gerenciacao_do_usuario, get_usuario_atual
-from app.core.database import SessionLocal, get_db
+from app.core.database import get_db
+from app.core.errors import BusinessRuleError, ConflictError, NotFoundError
+from app.core.security import (
+    hash_ip,
+    mascarar_pii,
+    rate_limit,
+    registrar_auditoria,
+    require_roles,
+)
 from app.models.models import (
-    Conversa, LoaPunicao, Gerenciacao, SoaIa, AnaliseFeedback, Prompt, VideoModelo, Usuario,
+    JobIa,
+    LinkPesquisa,
+    LogExportacao,
+    Pesquisa,
+    Submissao,
+    Usuario,
 )
 from app.schemas.schemas import (
-    ConversaCreate, ConversaResponse,
-    MensagemInput, ConsultaIAResponse,
-    LoaPunicaoCreate, LoaPunicaoResponse,
-    AnaliseFeedbackCreate, AnaliseFeedbackResponse,
+    LinkPesquisaCreate,
+    LinkPesquisaResponse,
+    PesquisaCreate,
+    PesquisaResponse,
+    PesquisaUpdate,
+    SubmissaoPublicaCreate,
+    SubmissaoResponse,
 )
-from app.services.ia_service import gerar_resposta_ia, analisar_sentimento
+from app.services.ia_service import classificar_nota_nps, processar_job_ia_background
 
-logger = logging.getLogger(__name__)
-
-# Todas as rotas deste arquivo exigem login
-router = APIRouter(dependencies=[Depends(get_usuario_atual)])
+router = APIRouter()
 
 
 # ══════════════════════════════════════════════════════════════════
-# CONVERSAS — CRUD
+# 1. PESQUISAS (SURVEYS) — Administração e Versionamento (RF-003, RF-004)
 # ══════════════════════════════════════════════════════════════════
 
 @router.post(
-    "/conversas",
-    response_model=ConversaResponse,
+    "/surveys",
+    response_model=PesquisaResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Criar nova conversa",
-    tags=["Conversas"],
+    summary="Criar nova pesquisa NPS (Requer ADMIN)",
+    tags=["Pesquisas (Surveys)"],
 )
-def criar_conversa(
-    payload: ConversaCreate,
+def criar_pesquisa(
+    payload: PesquisaCreate,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
+    admin: Usuario = Depends(require_roles("ADMIN")),
 ):
-    """
-    **Recebe:** titulo, tipo_consultor, configuracoes (o dono é o usuário logado)
-    **Retorna:** objeto da conversa criada
-    **Códigos:** 201 | 401 | 422
-    """
-    conversa = Conversa(**payload.model_dump(), fk_usuario=usuario.uuid)
-    db.add(conversa)
+    pesquisa = Pesquisa(
+        titulo=payload.titulo,
+        texto_pergunta_nps=payload.texto_pergunta_nps,
+        texto_pergunta_aberta=payload.texto_pergunta_aberta,
+        status="RASCUNHO",
+        numero_versao=1,
+        criado_por=admin.id,
+    )
+    db.add(pesquisa)
+    db.flush()
+
+    registrar_auditoria(
+        db=db,
+        id_usuario_ator=admin.id,
+        acao="CRIAR_PESQUISA",
+        tipo_entidade="PESQUISA",
+        id_entidade=pesquisa.id,
+        estado_depois={"titulo": pesquisa.titulo, "status": pesquisa.status, "versao": 1},
+    )
     db.commit()
-    db.refresh(conversa)
-    return conversa
+    db.refresh(pesquisa)
+    return pesquisa
 
 
 @router.get(
-    "/conversas",
-    response_model=List[ConversaResponse],
-    summary="Listar conversas",
-    tags=["Conversas"],
+    "/surveys",
+    response_model=List[PesquisaResponse],
+    summary="Listar pesquisas (Requer ADMIN ou ANALYST)",
+    tags=["Pesquisas (Surveys)"],
 )
-def listar_conversas(
-    fk_usuario: Optional[str] = None,
-    status: Optional[str] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+def listar_pesquisas(
+    status_filtro: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
+    usuario: Usuario = Depends(require_roles("ADMIN", "ANALYST")),
 ):
-    """
-    **Recebe:** filtros opcionais fk_usuario (só ADMIN) e status
-    **Retorna:** lista paginada de conversas
-    **Códigos:** 200 | 401
-    """
-    q = db.query(Conversa)
-    if usuario.papel != "ADMIN":
-        q = q.filter(Conversa.fk_usuario == usuario.uuid)
-    elif fk_usuario:
-        q = q.filter(Conversa.fk_usuario == fk_usuario)
-    if status:
-        q = q.filter(Conversa.status == status)
-    return q.offset(skip).limit(limit).all()
+    q = db.query(Pesquisa)
+    if status_filtro:
+        q = q.filter(Pesquisa.status == status_filtro.upper())
+    return q.order_by(Pesquisa.criada_em.desc()).offset(skip).limit(min(limit, 100)).all()
 
 
 @router.get(
-    "/conversas/{uuid}",
-    response_model=ConversaResponse,
-    summary="Buscar conversa por UUID",
-    tags=["Conversas"],
+    "/surveys/{pesquisa_id}",
+    response_model=PesquisaResponse,
+    summary="Detalhar pesquisa por ID (Requer ADMIN ou ANALYST)",
+    tags=["Pesquisas (Surveys)"],
 )
-def buscar_conversa(
-    uuid: str,
+def buscar_pesquisa(
+    pesquisa_id: str,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
+    usuario: Usuario = Depends(require_roles("ADMIN", "ANALYST")),
+):
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == pesquisa_id).first()
+    if not pesquisa:
+        raise NotFoundError(f"Pesquisa '{pesquisa_id}' não encontrada.")
+    return pesquisa
+
+
+@router.patch(
+    "/surveys/{pesquisa_id}",
+    response_model=PesquisaResponse,
+    summary="Atualizar pesquisa (Versiona automaticamente se já houver respostas - RF-004)",
+    tags=["Pesquisas (Surveys)"],
+)
+def atualizar_pesquisa(
+    pesquisa_id: str,
+    payload: PesquisaUpdate,
+    db: Session = Depends(get_db),
+    admin: Usuario = Depends(require_roles("ADMIN")),
 ):
     """
-    **Recebe:** uuid no path
-    **Retorna:** objeto da conversa
-    **Códigos:** 200 | 401 | 404
+    RF-004: Preservação de histórico e versionamento após a primeira resposta.
+    Se a pesquisa já possui submissões registradas, cria uma nova versão apontando
+    `id_pesquisa_pai` para a pesquisa original sem quebrar o histórico coletado.
     """
-    return buscar_conversa_do_usuario(db, uuid, usuario)
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == pesquisa_id).first()
+    if not pesquisa:
+        raise NotFoundError(f"Pesquisa '{pesquisa_id}' não encontrada.")
+
+    qtd_respostas = db.query(Submissao).filter(Submissao.id_pesquisa == pesquisa.id).count()
+    dados_update = payload.model_dump(exclude_unset=True)
+
+    if qtd_respostas > 0:
+        nova_versao = Pesquisa(
+            titulo=dados_update.get("titulo", pesquisa.titulo),
+            texto_pergunta_nps=dados_update.get("texto_pergunta_nps", pesquisa.texto_pergunta_nps),
+            texto_pergunta_aberta=dados_update.get("texto_pergunta_aberta", pesquisa.texto_pergunta_aberta),
+            status=pesquisa.status,
+            numero_versao=pesquisa.numero_versao + 1,
+            id_pesquisa_pai=pesquisa.id,
+            criado_por=admin.id,
+        )
+        pesquisa.status = "ARQUIVADA"
+        db.add(nova_versao)
+        db.flush()
+        registrar_auditoria(
+            db=db,
+            id_usuario_ator=admin.id,
+            acao="VERSIONAR_PESQUISA_COM_RESPOSTAS",
+            tipo_entidade="PESQUISA",
+            id_entidade=nova_versao.id,
+            estado_antes={"id_pai": pesquisa.id, "versao_anterior": pesquisa.numero_versao},
+            estado_depois={"id_nova": nova_versao.id, "numero_versao": nova_versao.numero_versao},
+        )
+        db.commit()
+        db.refresh(nova_versao)
+        return nova_versao
+
+    antes = {"titulo": pesquisa.titulo, "texto_pergunta_nps": pesquisa.texto_pergunta_nps}
+    for campo, valor in dados_update.items():
+        setattr(pesquisa, campo, valor)
+
+    registrar_auditoria(
+        db=db,
+        id_usuario_ator=admin.id,
+        acao="EDITAR_PESQUISA",
+        tipo_entidade="PESQUISA",
+        id_entidade=pesquisa.id,
+        estado_antes=antes,
+        estado_depois=dados_update,
+    )
+    db.commit()
+    db.refresh(pesquisa)
+    return pesquisa
+
+
+@router.post(
+    "/surveys/{pesquisa_id}/status/{novo_status}",
+    response_model=PesquisaResponse,
+    summary="Alterar ciclo de vida da pesquisa: PUBLICADA | PAUSADA | ARQUIVADA (Requer ADMIN)",
+    tags=["Pesquisas (Surveys)"],
+)
+def alterar_status_pesquisa(
+    pesquisa_id: str,
+    novo_status: str,
+    db: Session = Depends(get_db),
+    admin: Usuario = Depends(require_roles("ADMIN")),
+):
+    novo_status_up = novo_status.upper()
+    if novo_status_up not in {"RASCUNHO", "PUBLICADA", "PAUSADA", "ARQUIVADA"}:
+        raise BusinessRuleError("Status permitido: RASCUNHO, PUBLICADA, PAUSADA ou ARQUIVADA.")
+
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == pesquisa_id).first()
+    if not pesquisa:
+        raise NotFoundError(f"Pesquisa '{pesquisa_id}' não encontrada.")
+
+    status_anterior = pesquisa.status
+    pesquisa.status = novo_status_up
+
+    registrar_auditoria(
+        db=db,
+        id_usuario_ator=admin.id,
+        acao=f"ALTERAR_STATUS_PESQUISA_{novo_status_up}",
+        tipo_entidade="PESQUISA",
+        id_entidade=pesquisa.id,
+        estado_antes={"status": status_anterior},
+        estado_depois={"status": novo_status_up},
+    )
+    db.commit()
+    db.refresh(pesquisa)
+    return pesquisa
 
 
 # ══════════════════════════════════════════════════════════════════
-# ENDPOINT PRINCIPAL — CONSULTA À IA
-# Fluxo completo: Frontend → API → Gerenciacao → SOA_IA → IA → AnaliseFeedback → Resposta
+# 2. LINKS DE PESQUISA (NOMINAL uso único / ABERTO slug público - RF-005, RF-009)
 # ══════════════════════════════════════════════════════════════════
 
 @router.post(
-    "/conversas/consultar",
-    response_model=ConsultaIAResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Enviar mensagem e obter resposta da IA",
-    tags=["Consulta IA"],
+    "/surveys/{pesquisa_id}/links",
+    response_model=LinkPesquisaResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Gerar link/token para distribuição da pesquisa (Requer ADMIN)",
+    tags=["Links e Convites"],
 )
-async def consultar_ia(
-    payload: MensagemInput,
+def criar_link_pesquisa(
+    pesquisa_id: str,
+    payload: LinkPesquisaCreate,
+    db: Session = Depends(get_db),
+    admin: Usuario = Depends(require_roles("ADMIN")),
+):
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == pesquisa_id).first()
+    if not pesquisa:
+        raise NotFoundError(f"Pesquisa '{pesquisa_id}' não encontrada.")
+
+    token = payload.token_customizado or secrets.token_urlsafe(16)
+    if db.query(LinkPesquisa).filter(LinkPesquisa.token == token).first():
+        raise ConflictError(f"Token/slug '{token}' já está em uso.")
+
+    link = LinkPesquisa(
+        id_pesquisa=pesquisa.id,
+        tipo=payload.tipo,
+        token=token,
+    )
+    db.add(link)
+    db.flush()
+
+    registrar_auditoria(
+        db=db,
+        id_usuario_ator=admin.id,
+        acao="CRIAR_LINK_PESQUISA",
+        tipo_entidade="LINK_PESQUISA",
+        id_entidade=link.id,
+        estado_depois={"id_pesquisa": pesquisa.id, "tipo": link.tipo, "token": link.token},
+    )
+    db.commit()
+    db.refresh(link)
+    return link
+
+
+@router.get(
+    "/surveys/{pesquisa_id}/links",
+    response_model=List[LinkPesquisaResponse],
+    summary="Listar links de uma pesquisa (Requer ADMIN ou ANALYST)",
+    tags=["Links e Convites"],
+)
+def listar_links_pesquisa(
+    pesquisa_id: str,
+    db: Session = Depends(get_db),
+    usuario: Usuario = Depends(require_roles("ADMIN", "ANALYST")),
+):
+    return db.query(LinkPesquisa).filter(LinkPesquisa.id_pesquisa == pesquisa_id).all()
+
+
+# ══════════════════════════════════════════════════════════════════
+# 3. FLUXO PÚBLICO DO RESPONDENTE (Mobile-First, Antiduplicidade, IA Assíncrona)
+# ══════════════════════════════════════════════════════════════════
+
+@router.get(
+    "/public/surveys/{token}",
+    summary="Carregar pesquisa pública por token/slug (Sem necessidade de conta)",
+    tags=["Fluxo Público (Respondente)"],
+    dependencies=[Depends(rate_limit("public_survey_view", max_requests=60, window_seconds=60))],
+)
+def carregar_pesquisa_publica(token: str, db: Session = Depends(get_db)):
+    link = db.query(LinkPesquisa).filter(LinkPesquisa.token == token).first()
+    if not link:
+        raise NotFoundError("Link de pesquisa inválido ou expirado.")
+
+    if link.tipo == "NOMINAL" and link.usado_em is not None:
+        raise ConflictError("Este convite nominal já foi respondido.")
+
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == link.id_pesquisa).first()
+    if not pesquisa or pesquisa.status != "PUBLICADA":
+        raise BusinessRuleError("Esta pesquisa não está ativa para coleta de respostas no momento.")
+
+    return {
+        "id_pesquisa": pesquisa.id,
+        "titulo": pesquisa.titulo,
+        "texto_pergunta_nps": pesquisa.texto_pergunta_nps,
+        "texto_pergunta_aberta": pesquisa.texto_pergunta_aberta,
+        "tipo_link": link.tipo,
+        "escala_nps": {"min": 0, "max": 10},
+    }
+
+
+@router.post(
+    "/public/submissions",
+    response_model=SubmissaoResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Enviar resposta NPS (Persistência transacional + Job IA assíncrono não-bloqueante)",
+    tags=["Fluxo Público (Respondente)"],
+    dependencies=[Depends(rate_limit("public_submission", max_requests=20, window_seconds=60))],
+)
+async def enviar_submissao_publica(
+    payload: SubmissaoPublicaCreate,
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
 ):
     """
-    **Fluxo completo:**
-    1. Valida a conversa
-    2. Registra LOA_PUNICAO com o input
-    3. Cria GERENCIACAO (sessão de processamento)
-    4. Cria SOA_IA com status PROCESSANDO
-    5. Busca o prompt ativo do modelo IA atual
-    6. Chama a IA (OpenAI)
-    7. Atualiza SOA_IA → CONCLUIDO
-    8. Agenda análise de feedback em background
-    9. Retorna a resposta
-
-    **Recebe:** conversa_uuid, mensagem, tipo_consultor (opcional)
-    **Retorna:** resposta da IA + metadados de uso
-    **Códigos:** 200 | 401 | 404 | 422 | 502 | 503 | 504
+    Regras de Integridade do PRD:
+      1. Somente pesquisa PUBLICADA (ACTIVE) aceita resposta.
+      2. A nota NPS deve ser um inteiro entre 0 e 10.
+      3. Mesma chave_idempotencia ou token NOMINAL já utilizado bloqueia duplicidade (409).
+      4. Submissão é persistida em transação única e é imutável.
+      5. A IA roda em JOB_IA assíncrono e NUNCA bloqueia ou desfaz a submissão.
     """
-    # 1. Valida conversa
-    conversa = buscar_conversa_do_usuario(db, payload.conversa_uuid, usuario)
+    # 1. Verifica link e pesquisa ativa
+    link = db.query(LinkPesquisa).filter(LinkPesquisa.token == payload.token_link).first()
+    if not link:
+        raise NotFoundError("Token de pesquisa não encontrado.")
 
-    # 2. Registra LOA_PUNICAO (atributos de entrada)
-    loa = LoaPunicao(
-        fk_conversa_set=conversa.uuid,
-        tipo="CONSULTA_USUARIO",
-        boolean_status=True,
-        metodo_ativo=payload.tipo_consultor or conversa.tipo_consultor,
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == link.id_pesquisa).first()
+    if not pesquisa or pesquisa.status != "PUBLICADA":
+        raise BusinessRuleError("Somente pesquisas com status PUBLICADA aceitam respostas.")
+
+    # 2. Antiduplicidade: token NOMINAL de uso único (RF-012)
+    if link.tipo == "NOMINAL" and link.usado_em is not None:
+        raise ConflictError("Este link nominal já foi utilizado para uma submissão anterior.")
+
+    # 3. Antiduplicidade: chave_idempotencia única (Regra 6 do PRD)
+    duplicada = (
+        db.query(Submissao)
+        .filter(Submissao.chave_idempotencia == payload.chave_idempotencia)
+        .first()
     )
-    db.add(loa)
+    if duplicada:
+        raise ConflictError("Submissão duplicada detectada pela chave de idempotência.")
+
+    # 4. LGPD: avalia status de mascaramento de PII e pseudonimiza IP com SHA-256
+    _, status_pii = mascarar_pii(payload.texto_comentario)
+    client_ip = request.client.host if request.client else None
+    ip_pseudonimizado = hash_ip(client_ip)
+
+    # 5. Transação atômica: persiste Submissao + marca LinkPesquisa + cria JobIa
+    submissao = Submissao(
+        id_pesquisa=pesquisa.id,
+        id_link_pesquisa=link.id,
+        nota_nps=payload.nota_nps,
+        texto_comentario=payload.texto_comentario,
+        chave_idempotencia=payload.chave_idempotencia,
+        fingerprint_dispositivo=payload.fingerprint_dispositivo,
+        endereco_ip=ip_pseudonimizado,
+        status="VALIDA",
+        status_mascaramento_pii=status_pii,
+    )
+    db.add(submissao)
     db.flush()
 
-    # 3. Cria GERENCIACAO
-    gerenciacao = Gerenciacao(
-        fk_pessoa=conversa.fk_usuario,
-        fk_loa_punicao=loa.uuid,
-        tipo_pot="Q",
-        status="PROCESSANDO",
-        chave_referencia=str(uuid_lib.uuid4()),
-    )
-    db.add(gerenciacao)
-    db.flush()
+    if link.tipo == "NOMINAL":
+        link.usado_em = datetime.utcnow()
 
-    # 4. Cria SOA_IA
-    soa = SoaIa(
-        fk_gerenciacao=gerenciacao.uuid,
-        status="PROCESSANDO",
-        allow_queue=True,
-    )
-    db.add(soa)
-    db.commit()
-
-    # 5. Busca prompt ativo
-    modelo_atual = db.query(VideoModelo).filter(VideoModelo.is_current == True).first()
-    prompt_obj = None
-    if modelo_atual:
-        prompt_obj = (
-            db.query(Prompt)
-            .filter(Prompt.fk_video_modelo == modelo_atual.uuid, Prompt.status_ativo == True)
-            .first()
+    job_ia = None
+    if payload.texto_comentario and payload.texto_comentario.strip():
+        job_ia = JobIa(
+            id_submissao=submissao.id,
+            status="NA_FILA",
+            tentativas=0,
         )
+        db.add(job_ia)
 
-    prompt_sistema = (
-        prompt_obj.conteudo if prompt_obj
-        else "Você é um consultor especializado. Responda de forma clara e objetiva."
-    )
-
-    # 6. Chama a IA (erros tratados em ia_service → propagados para error handlers).
-    # Se falhar, marca FALHA antes de propagar, para não ficar PROCESSANDO para sempre.
-    try:
-        resultado_ia = await gerar_resposta_ia(
-            prompt_sistema=prompt_sistema,
-            mensagem_usuario=payload.mensagem,
-        )
-    except Exception:
-        soa.status = "FALHA"
-        gerenciacao.status = "FALHA"
-        db.commit()
-        raise
-
-    # 7. Atualiza SOA_IA
-    soa.status = "CONCLUIDO"
-    gerenciacao.status = "CONCLUIDO"
     db.commit()
-    db.refresh(soa)
+    db.refresh(submissao)
 
-    # 8. Análise de feedback em background (não bloqueia a resposta)
-    background_tasks.add_task(
-        _salvar_analise_feedback,
-        gerenciacao_uuid=gerenciacao.uuid,
-        texto=payload.mensagem + " " + resultado_ia["content"],
-        fk_video_modelo=modelo_atual.uuid if modelo_atual else None,
-    )
+    # 6. Dispara análise qualitativa por IA em background (falha na IA jamais afeta a submissão)
+    if job_ia:
+        background_tasks.add_task(processar_job_ia_background, job_ia.id)
 
-    return ConsultaIAResponse(
-        gerenciacao_uuid=gerenciacao.uuid,
-        soa_ia_uuid=soa.uuid,
-        resposta=resultado_ia["content"],
-        tokens_entrada=resultado_ia["tokens_entrada"],
-        tokens_saida=resultado_ia["tokens_saida"],
-        modelo_utilizado=resultado_ia["modelo_utilizado"],
-        finish_reason=resultado_ia["finish_reason"],
-        created_at=datetime.now(timezone.utc),
-    )
-
-
-async def _salvar_analise_feedback(gerenciacao_uuid: str, texto: str, fk_video_modelo: str = None):
-    """Tarefa de background: analisa sentimento e persiste ANALISE_FEEDBACK."""
-    db = SessionLocal()
-    try:
-        resultado = await analisar_sentimento(texto)   # já validado pelo Pydantic
-        db.add(AnaliseFeedback(
-            fk_gerenciacao=gerenciacao_uuid,
-            fk_video_modelo=fk_video_modelo,
-            **resultado,
-            status="CONCLUIDO",
-        ))
-        db.commit()
-    except Exception as exc:
-        # Só o tipo: a mensagem pode trazer trechos do texto analisado
-        logger.error("Erro ao salvar análise de feedback (%s)", type(exc).__name__)
-        db.rollback()
-    finally:
-        db.close()
+    resposta = SubmissaoResponse.model_validate(submissao)
+    resposta.classificacao_nps = classificar_nota_nps(submissao.nota_nps)
+    return resposta
 
 
 # ══════════════════════════════════════════════════════════════════
-# LOA_PUNICAO
-# ══════════════════════════════════════════════════════════════════
-
-@router.post(
-    "/loa-punicao",
-    response_model=LoaPunicaoResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Registrar LOA / Punição",
-    tags=["LOA Punição"],
-)
-def criar_loa_punicao(
-    payload: LoaPunicaoCreate,
-    db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
-):
-    """
-    **Recebe:** fk_conversa_set, tipo, boolean_status, valor, metodo_ativo
-    **Retorna:** registro criado
-    **Códigos:** 201 | 401 | 404 | 422
-    """
-    buscar_conversa_do_usuario(db, payload.fk_conversa_set, usuario)
-    loa = LoaPunicao(**payload.model_dump())
-    db.add(loa)
-    db.commit()
-    db.refresh(loa)
-    return loa
-
-
-@router.get(
-    "/loa-punicao/{conversa_uuid}",
-    response_model=List[LoaPunicaoResponse],
-    summary="Listar LOAs de uma conversa",
-    tags=["LOA Punição"],
-)
-def listar_loa_punicao(
-    conversa_uuid: str,
-    db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
-):
-    """
-    **Recebe:** conversa_uuid no path
-    **Retorna:** lista de LOAs associadas
-    **Códigos:** 200 | 401 | 404
-    """
-    buscar_conversa_do_usuario(db, conversa_uuid, usuario)
-    return db.query(LoaPunicao).filter(LoaPunicao.fk_conversa_set == conversa_uuid).all()
-
-
-# ══════════════════════════════════════════════════════════════════
-# ANALISE_FEEDBACK
+# 4. CONSULTA DE SUBMISSÕES E EXPORTAÇÃO CSV AUDITADA (RF-016, RF-019, LGPD)
 # ══════════════════════════════════════════════════════════════════
 
 @router.get(
-    "/analises-feedback",
-    response_model=List[AnaliseFeedbackResponse],
-    summary="Listar análises de feedback",
-    tags=["Análise Feedback"],
+    "/submissions",
+    response_model=List[SubmissaoResponse],
+    summary="Listar submissões com filtros por pesquisa e classificação (Requer ADMIN ou ANALYST)",
+    tags=["Submissões e Exportação"],
 )
-def listar_analises_feedback(
-    fk_gerenciacao: Optional[str] = None,
-    sentimento: Optional[str] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+def listar_submissoes(
+    id_pesquisa: Optional[str] = None,
+    classificacao: Optional[str] = None,
+    busca: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
+    usuario: Usuario = Depends(require_roles("ADMIN", "ANALYST")),
 ):
-    """
-    **Recebe:** filtros opcionais fk_gerenciacao e sentimento
-    **Retorna:** lista paginada (só das gerenciações do usuário, exceto ADMIN)
-    **Códigos:** 200 | 401
-    """
-    q = db.query(AnaliseFeedback)
-    if usuario.papel != "ADMIN":
-        q = q.join(Gerenciacao, AnaliseFeedback.fk_gerenciacao == Gerenciacao.uuid) \
-             .filter(Gerenciacao.fk_pessoa == usuario.uuid)
-    if fk_gerenciacao:
-        q = q.filter(AnaliseFeedback.fk_gerenciacao == fk_gerenciacao)
-    if sentimento:
-        q = q.filter(AnaliseFeedback.sentimento == sentimento)
-    return q.offset(skip).limit(limit).all()
+    q = db.query(Submissao).filter(Submissao.status == "VALIDA")
+    if id_pesquisa:
+        q = q.filter(Submissao.id_pesquisa == id_pesquisa)
+    if classificacao:
+        c = classificacao.upper()
+        if c == "PROMOTOR":
+            q = q.filter(Submissao.nota_nps >= 9)
+        elif c == "NEUTRO":
+            q = q.filter(Submissao.nota_nps.between(7, 8))
+        elif c == "DETRATOR":
+            q = q.filter(Submissao.nota_nps <= 6)
+    if busca:
+        q = q.filter(Submissao.texto_comentario.ilike(f"%{busca}%"))
+
+    itens = q.order_by(Submissao.criada_em.desc()).offset(skip).limit(min(limit, 200)).all()
+    resultado = []
+    for sub in itens:
+        r = SubmissaoResponse.model_validate(sub)
+        r.classificacao_nps = classificar_nota_nps(sub.nota_nps)
+        # Mascaramento preventivo na visualização se houver PII no comentário
+        if sub.texto_comentario:
+            texto_limpo, _ = mascarar_pii(sub.texto_comentario)
+            r.texto_comentario = texto_limpo
+        resultado.append(r)
+    return resultado
 
 
-@router.post(
-    "/analises-feedback",
-    response_model=AnaliseFeedbackResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Solicitar análise de feedback manualmente",
-    tags=["Análise Feedback"],
+@router.get(
+    "/submissions/export/csv",
+    summary="Exportar submissões de uma pesquisa em CSV com registro obrigatório em LOG_EXPORTACAO",
+    tags=["Submissões e Exportação"],
 )
-async def criar_analise_feedback(
-    payload: AnaliseFeedbackCreate,
+def exportar_submissoes_csv(
+    id_pesquisa: str,
+    anonimizado: bool = True,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_usuario_atual),
+    usuario: Usuario = Depends(require_roles("ADMIN", "ANALYST")),
 ):
-    """
-    Dispara análise de sentimento via IA manualmente.
-    **Recebe:** fk_gerenciacao, fk_video_modelo, texto_para_analisar
-    **Retorna:** resultado da análise
-    **Códigos:** 201 | 401 | 404 | 422 | 502 | 503
-    """
-    buscar_gerenciacao_do_usuario(db, payload.fk_gerenciacao, usuario)
-    resultado = await analisar_sentimento(payload.texto_para_analisar)
-    fb = AnaliseFeedback(
-        fk_gerenciacao=payload.fk_gerenciacao,
-        fk_video_modelo=payload.fk_video_modelo,
-        **resultado,
-        status="CONCLUIDO",
+    pesquisa = db.query(Pesquisa).filter(Pesquisa.id == id_pesquisa).first()
+    if not pesquisa:
+        raise NotFoundError(f"Pesquisa '{id_pesquisa}' não encontrada.")
+
+    # LGPD: Analistas só podem exportar dados anonimizados; apenas ADMIN pode solicitar não-anonimizado
+    if not anonimizado and usuario.papel != "ADMIN":
+        anonimizado = True
+
+    submissoes = (
+        db.query(Submissao)
+        .filter(Submissao.id_pesquisa == id_pesquisa, Submissao.status == "VALIDA")
+        .order_by(Submissao.criada_em.asc())
+        .all()
     )
-    db.add(fb)
+
+    campos = ["id", "id_pesquisa", "nota_nps", "classificacao_nps", "texto_comentario", "criada_em"]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(campos)
+
+    for s in submissoes:
+        comentario = s.texto_comentario or ""
+        if anonimizado and comentario:
+            comentario, _ = mascarar_pii(comentario)
+        writer.writerow([
+            s.id,
+            s.id_pesquisa,
+            s.nota_nps,
+            classificar_nota_nps(s.nota_nps),
+            comentario,
+            s.criada_em.isoformat(),
+        ])
+
+    # Registra obrigatoriamente em LOG_EXPORTACAO e LOG_AUDITORIA (Pág. 7 e 9 do PRD)
+    log_exp = LogExportacao(
+        id_analista=usuario.id,
+        id_pesquisa=id_pesquisa,
+        campos_exportados=",".join(campos),
+        anonimizado=anonimizado,
+    )
+    db.add(log_exp)
+    db.flush()
+
+    registrar_auditoria(
+        db=db,
+        id_usuario_ator=usuario.id,
+        acao="EXPORTAR_CSV_SUBMISSOES",
+        tipo_entidade="LOG_EXPORTACAO",
+        id_entidade=log_exp.id,
+        estado_depois={
+            "id_pesquisa": id_pesquisa,
+            "qtd_registros": len(submissoes),
+            "anonimizado": anonimizado,
+        },
+    )
     db.commit()
-    db.refresh(fb)
-    return fb
+
+    output.seek(0)
+    filename = f"nps_keycore_{id_pesquisa[:8]}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
