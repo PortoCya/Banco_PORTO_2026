@@ -1,292 +1,272 @@
 """
-Schemas Pydantic — Request / Response para todos os endpoints.
+Schemas Pydantic v2 — NPS KeyCore v1.0.
+Proteção contra Mass Assignment (extra='forbid'), validação estrita de limites e sanitização XSS.
 """
-from __future__ import annotations
-import json
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, EmailStr, Field, field_validator
-import uuid
+from datetime import datetime, date
+from typing import Optional, List, Literal, Dict, Any
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
+
+from app.core.security import sanitizar_texto
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-class OkResponse(BaseModel):
-    ok: bool = True
-    message: str = "Operação realizada com sucesso."
+# ─── Base segura contra Mass Assignment ───────────────────────────────────────
+class StrictInputModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
-class ErrorDetail(BaseModel):
-    code: str
-    message: str
-    details: Optional[Any] = None
+class ORMOutputModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
 
 
-class ErrorResponse(BaseModel):
-    error: ErrorDetail
+# ─── 1. AUTENTICAÇÃO E USUARIO (ADMIN | ANALYST) ──────────────────────────────
+class LoginRequest(StrictInputModel):
+    email: EmailStr
+    senha: str = Field(..., min_length=6, max_length=128)
 
 
-# ══════════════════════════════════════════════════════════════════
-# USUARIO
-# ══════════════════════════════════════════════════════════════════
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in_minutes: int
+    papel: str
+    usuario_id: str
 
-# Teto de 128 evita que uma senha gigante deixe o Argon2 lento de propósito
-SENHA_MIN, SENHA_MAX = 12, 128
 
-
-class UsuarioCreate(BaseModel):
+class UsuarioCreate(StrictInputModel):
     nome: str = Field(..., min_length=2, max_length=200)
-    email: EmailStr = Field(..., max_length=200)
-    senha: str = Field(..., min_length=SENHA_MIN, max_length=SENHA_MAX)
-    papel: str = Field("ANALYST", pattern="^(ADMIN|ANALYST)$")
+    email: EmailStr
+    senha: str = Field(..., min_length=8, max_length=128, description="Mínimo 8 caracteres")
+    papel: Literal["ADMIN", "ANALYST"] = "ANALYST"
 
-    @field_validator("email")
+    @field_validator("nome")
     @classmethod
-    def email_minusculo(cls, v: str) -> str:
-        return v.lower()
+    def _clean_nome(cls, v: str) -> str:
+        return sanitizar_texto(v)
 
-class UsuarioUpdate(BaseModel):
-    nome: Optional[str] = Field(None, min_length=2, max_length=200)
-    papel: Optional[str] = Field(None, pattern="^(ADMIN|ANALYST)$")
-    ativo: Optional[bool] = None
 
-class UsuarioResponse(BaseModel):
-    uuid: str
+class UsuarioResponse(ORMOutputModel):
+    id: str
     nome: str
     email: str
     papel: str
     ativo: bool
     criado_em: datetime
+    # NOTA DE SEGURANÇA: senha_hash JAMAIS é incluída no response schema
 
-    model_config = {"from_attributes": True}
 
+# ─── 2. PESQUISA (Survey — RASCUNHO | PUBLICADA | PAUSADA | ARQUIVADA) ────────
+class PesquisaCreate(StrictInputModel):
+    titulo: str = Field(..., min_length=3, max_length=300)
+    texto_pergunta_nps: str = Field(
+        default="Em uma escala de 0 a 10, o quanto você recomendaria a KeyCore?",
+        min_length=5,
+        max_length=1000,
+    )
+    texto_pergunta_aberta: Optional[str] = Field(
+        default="Qual é o principal motivo para a sua nota?",
+        max_length=1000,
+    )
 
-# ══════════════════════════════════════════════════════════════════
-# AUTENTICAÇÃO
-# ══════════════════════════════════════════════════════════════════
-
-class LoginRequest(BaseModel):
-    email: EmailStr = Field(..., max_length=200)
-    senha: str = Field(..., min_length=1, max_length=SENHA_MAX)
-
-    @field_validator("email")
+    @field_validator("titulo", "texto_pergunta_nps", "texto_pergunta_aberta")
     @classmethod
-    def email_minusculo(cls, v: str) -> str:
-        return v.lower()
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int                 # segundos
+    def _clean_text(cls, v: Optional[str]) -> Optional[str]:
+        return sanitizar_texto(v)
 
 
-# ══════════════════════════════════════════════════════════════════
-# VIDEO_MODELO
-# ══════════════════════════════════════════════════════════════════
+class PesquisaUpdate(StrictInputModel):
+    titulo: Optional[str] = Field(None, min_length=3, max_length=300)
+    texto_pergunta_nps: Optional[str] = Field(None, min_length=5, max_length=1000)
+    texto_pergunta_aberta: Optional[str] = Field(None, max_length=1000)
 
-class VideoModeloCreate(BaseModel):
-    provider: str = Field(..., min_length=1, max_length=100)
-    nome_modelo: str = Field(..., min_length=1, max_length=100)
-    status_ativo: bool = True
-    is_current: bool = False
-
-class VideoModeloResponse(BaseModel):
-    uuid: str
-    provider: str
-    nome_modelo: str
-    status_ativo: bool
-    is_current: bool
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-# ══════════════════════════════════════════════════════════════════
-# CONVERSA
-# ══════════════════════════════════════════════════════════════════
-
-class ConversaCreate(BaseModel):
-    # fk_usuario não vem do cliente: é sempre o usuário logado
-    titulo: Optional[str] = Field(None, max_length=200)
-    tipo_consultor: Optional[str] = Field(None, max_length=100)
-    configuracoes: Optional[Dict[str, Any]] = None
-
-    @field_validator("configuracoes")
+    @field_validator("titulo", "texto_pergunta_nps", "texto_pergunta_aberta")
     @classmethod
-    def configuracoes_pequenas(cls, v):
-        if v is not None and len(json.dumps(v)) > 10_000:
-            raise ValueError("configuracoes muito grande (máx. 10.000 caracteres em JSON).")
-        return v
+    def _clean_text(cls, v: Optional[str]) -> Optional[str]:
+        return sanitizar_texto(v)
 
-class MensagemInput(BaseModel):
-    """Mensagem enviada pelo usuário dentro de uma conversa."""
-    conversa_uuid: str = Field(..., max_length=36)
-    mensagem: str = Field(..., min_length=1, max_length=10000)
-    tipo_consultor: Optional[str] = Field(None, max_length=100)
 
-    @field_validator("mensagem")
-    @classmethod
-    def mensagem_nao_vazia(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("Mensagem não pode ser vazia ou apenas espaços.")
-        return v.strip()
-
-class ConversaResponse(BaseModel):
-    uuid: str
-    fk_usuario: str
-    titulo: Optional[str]
-    tipo_consultor: Optional[str]
+class PesquisaResponse(ORMOutputModel):
+    id: str
+    titulo: str
+    texto_pergunta_nps: str
+    texto_pergunta_aberta: Optional[str]
     status: str
-    created_at: datetime
-    updated_at: datetime
+    numero_versao: int
+    id_pesquisa_pai: Optional[str]
+    criado_por: str
+    criada_em: datetime
+    atualizada_em: datetime
 
-    model_config = {"from_attributes": True}
+
+# ─── 3. LINK_PESQUISA (Convites / Links públicos: NOMINAL | ABERTO) ───────────
+class LinkPesquisaCreate(StrictInputModel):
+    tipo: Literal["NOMINAL", "ABERTO"] = "ABERTO"
+    token_customizado: Optional[str] = Field(None, min_length=4, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
 
 
-# ══════════════════════════════════════════════════════════════════
-# GERENCIACAO
-# ══════════════════════════════════════════════════════════════════
+class LinkPesquisaResponse(ORMOutputModel):
+    id: str
+    id_pesquisa: str
+    tipo: str
+    token: str
+    usado_em: Optional[datetime]
+    criado_em: datetime
 
-class GerenciacaoCreate(BaseModel):
-    # fk_pessoa e credencial_ip não vêm do cliente: saem do login e da conexão
-    tipo_pot: Optional[str] = Field(None, max_length=50)
+
+# ─── 4. SUBMISSAO (Fluxo Público Mobile-First + Persistência Transacional) ────
+class SubmissaoPublicaCreate(StrictInputModel):
+    token_link: str = Field(..., min_length=4, max_length=128, description="Token do LINK_PESQUISA")
+    nota_nps: int = Field(..., ge=0, le=10, description="Nota NPS inteira obrigatória entre 0 e 10")
+    texto_comentario: Optional[str] = Field(None, max_length=4000, description="Comentário complementar opcional")
+    chave_idempotencia: str = Field(..., min_length=8, max_length=128, description="Chave única para evitar duplicidade")
     fingerprint_dispositivo: Optional[str] = Field(None, max_length=255)
 
-class GerenciacaoResponse(BaseModel):
-    uuid: str
-    fk_pessoa: str
-    tipo_pot: Optional[str]
+    @field_validator("texto_comentario")
+    @classmethod
+    def _clean_comentario(cls, v: Optional[str]) -> Optional[str]:
+        return sanitizar_texto(v)
+
+
+class SubmissaoResponse(ORMOutputModel):
+    id: str
+    id_pesquisa: str
+    id_link_pesquisa: Optional[str]
+    nota_nps: int
+    classificacao_nps: Optional[str] = None
+    texto_comentario: Optional[str]
+    chave_idempotencia: str
     status: str
-    chave_referencia: str
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
+    status_mascaramento_pii: str
+    criada_em: datetime
 
 
-# ══════════════════════════════════════════════════════════════════
-# SOA_IA
-# ══════════════════════════════════════════════════════════════════
+# ─── 5. SNAPSHOT_NPS E ANALYTICS DETERMINÍSTICO ──────────────────────────────
+class SnapshotNpsResponse(ORMOutputModel):
+    id: str
+    id_pesquisa: str
+    periodo_inicio: date
+    periodo_fim: date
+    valor_nps: int
+    total_respostas: int
+    qtd_promotores: int
+    qtd_neutros: int
+    qtd_detratores: int
+    pct_promotores: float = 0.0
+    pct_neutros: float = 0.0
+    pct_detratores: float = 0.0
+    calculado_em: datetime
 
-class SoaIaResponse(BaseModel):
-    uuid: str
-    fk_gerenciacao: str
+
+# ─── 6. IA QUALITATIVA: PROMPT, VERSAO_MODELO, JOB_IA, ANALISE_FEEDBACK ──────
+class PromptCreate(StrictInputModel):
+    objetivo: str = Field(..., min_length=5, max_length=2000)
+    contexto: str = Field(..., min_length=5, max_length=4000)
+    saida_esperada: str = Field(..., min_length=5, max_length=2000)
+    problemas_encontrados: Optional[str] = Field(None, max_length=2000)
+
+
+class PromptResponse(ORMOutputModel):
+    id: str
+    objetivo: str
+    contexto: str
+    saida_esperada: str
+    problemas_encontrados: Optional[str]
+    criado_em: datetime
+
+
+class VersaoModeloCreate(StrictInputModel):
+    provedor: str = Field(default="Google Gemini", max_length=100)
+    nome_modelo: str = Field(default="gemini-2.0-flash", max_length=100)
+    rotulo_versao: str = Field(..., max_length=100)
+    id_prompt: str
+    ativa: bool = True
+
+
+class VersaoModeloResponse(ORMOutputModel):
+    id: str
+    provedor: str
+    nome_modelo: str
+    rotulo_versao: str
+    id_prompt: str
+    ativa: bool
+    promovida_em: Optional[datetime]
+
+
+class JobIaResponse(ORMOutputModel):
+    id: str
+    id_submissao: str
     status: str
-    allow_queue: bool
-    created_at: datetime
-    updated_at: datetime
+    tentativas: int
+    ultimo_erro: Optional[str]
+    proxima_tentativa_em: Optional[datetime]
+    criado_em: datetime
 
-    model_config = {"from_attributes": True}
 
-
-# ══════════════════════════════════════════════════════════════════
-# ANALISE_FEEDBACK
-# ══════════════════════════════════════════════════════════════════
-
-class AnaliseFeedbackCreate(BaseModel):
-    fk_gerenciacao: str = Field(..., max_length=36)
-    fk_video_modelo: Optional[str] = Field(None, max_length=36)
-    texto_para_analisar: str = Field(..., min_length=5, max_length=2000)
-
-class AnaliseFeedbackResponse(BaseModel):
-    uuid: str
-    fk_gerenciacao: str
-    sentimento: Optional[str]
-    tema: Optional[str]
-    confianca: Optional[float]
+class AnaliseFeedbackResponse(ORMOutputModel):
+    id: str
+    id_submissao: str
+    id_versao_modelo: str
+    sentimento: str
+    tema: str
+    confianca: float
     justificativa: Optional[str]
-    sugestoes_acao: Optional[Any]
+    sequencia_versao: int
     status: str
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-# ══════════════════════════════════════════════════════════════════
-# LOA_PUNICAO
-# ══════════════════════════════════════════════════════════════════
-
-class LoaPunicaoCreate(BaseModel):
-    fk_conversa_set: str = Field(..., max_length=36)
-    tipo: str = Field(..., max_length=50)
-    boolean_status: bool = False
-    valor: Optional[float] = None
-    metodo_ativo: Optional[str] = Field(None, max_length=100)
-
-class LoaPunicaoResponse(BaseModel):
-    uuid: str
-    fk_conversa_set: str
-    tipo: str
-    boolean_status: bool
-    valor: Optional[float]
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
+    criada_em: datetime
+    atualizada_em: datetime
 
 
-# ══════════════════════════════════════════════════════════════════
-# PROMPT
-# ══════════════════════════════════════════════════════════════════
-
-class PromptCreate(BaseModel):
-    fk_video_modelo: str = Field(..., max_length=36)
-    conteudo: str = Field(..., min_length=10, max_length=20000)
-    contexto: Optional[str] = Field(None, max_length=5000)
-    prompt_engenharia_template: Optional[str] = Field(None, max_length=20000)
-    status_ativo: bool = True
-
-class PromptResponse(BaseModel):
-    uuid: str
-    fk_video_modelo: str
-    conteudo: str
-    status_ativo: bool
-
-    model_config = {"from_attributes": True}
+# ─── 7. GOLDEN SET, AUDITORIA, EXPORTAÇÃO, CIRCUIT BREAKER E TELEMETRIA ──────
+class ComentarioGoldenSetCreate(StrictInputModel):
+    texto_comentario: str = Field(..., min_length=3, max_length=2000)
+    rotulo_sentimento_humano: Literal["POSITIVO", "NEUTRO", "NEGATIVO"]
+    rotulo_tema_humano: str = Field(..., min_length=2, max_length=100)
 
 
-# ══════════════════════════════════════════════════════════════════
-# DIMENSOES_KPIS
-# ══════════════════════════════════════════════════════════════════
-
-class DimensoesKpisResponse(BaseModel):
-    uuid: str
-    fk_gerencia: str
-    data: Optional[datetime]
-    periodo_fim: Optional[datetime]
-    valor_pot: Optional[float]
-    get_pontuacoes: Optional[float]
-    get_pontuacoes2: Optional[float]
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
+class ComentarioGoldenSetResponse(ORMOutputModel):
+    id: str
+    texto_comentario: str
+    rotulo_sentimento_humano: str
+    rotulo_tema_humano: str
+    criado_em: datetime
 
 
-# ══════════════════════════════════════════════════════════════════
-# MATRIZ_PUNICAO_SET
-# ══════════════════════════════════════════════════════════════════
-
-class MatrizPunicaoSetResponse(BaseModel):
-    uuid: str
-    fk_loa_punicao: str
-    boolean_relevante: bool
-    nota_pot: Optional[float]
-    nota_relevancia: Optional[float]
-    get_pontuacao: Optional[float]
-    get_pontuacao2: Optional[float]
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
+class LogAuditoriaResponse(ORMOutputModel):
+    id: str
+    id_usuario_ator: Optional[str]
+    acao: str
+    tipo_entidade: str
+    id_entidade: str
+    estado_antes: Optional[Dict[str, Any]]
+    estado_depois: Optional[Dict[str, Any]]
+    criado_em: datetime
 
 
-# ══════════════════════════════════════════════════════════════════
-# RESPOSTAS DA IA (endpoint /consultar)
-# ══════════════════════════════════════════════════════════════════
+class LogExportacaoResponse(ORMOutputModel):
+    id: str
+    id_analista: str
+    id_pesquisa: str
+    campos_exportados: str
+    anonimizado: bool
+    criado_em: datetime
 
-class ConsultaIAResponse(BaseModel):
-    gerenciacao_uuid: str
-    soa_ia_uuid: str
-    resposta: str
-    tokens_entrada: int
-    tokens_saida: int
-    modelo_utilizado: str
-    finish_reason: str
-    created_at: datetime
+
+class EventoCircuitBreakerResponse(ORMOutputModel):
+    id: str
+    motivo: str
+    custo_acumulado: float
+    limite_custo: float
+    disparado_em: datetime
+    resolvido_em: Optional[datetime]
+
+
+class SnapshotTelemetriaResponse(ORMOutputModel):
+    id: str
+    inicio_janela: datetime
+    fim_janela: datetime
+    latencia_p50_ms: int
+    latencia_p95_ms: int
+    taxa_erro_5xx: float
+    pct_descartado_ec12: float
+    pct_descartado_ec13: float
+    qtd_pii_mascaramento_falhou: int
+    status_circuit_breaker: str
