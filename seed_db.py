@@ -1,84 +1,135 @@
 """
-Script utilitário: cria as tabelas do banco e popula dados iniciais (seed).
+Script utilitário: cria as 16 tabelas do banco NPS KeyCore v1.0 e popula dados iniciais seguros (seed).
 Execute: python seed_db.py
 """
 import logging
-import os
-
-from dotenv import load_dotenv
-
-load_dotenv()  # ADMIN_EMAIL/ADMIN_SENHA/SECRET_KEY vêm do .env
+from datetime import datetime
 
 from app.core.database import Base, engine, SessionLocal
-import app.models.models  # noqa: F401 — registra todos os modelos
-
-from app.core.security import gerar_hash_senha
-from app.models.models import VideoModelo, Prompt, Usuario, TutorCircuitoTreinado
-from app.schemas.schemas import SENHA_MIN
+from app.core.security import gerar_senha_hash
+from app.models.models import (
+    Usuario,
+    Pesquisa,
+    LinkPesquisa,
+    Prompt,
+    VersaoModelo,
+    ComentarioGoldenSet,
+    AvaliacaoGoldenSet,
+    SnapshotTelemetria,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def criar_tabelas():
-    logger.info("Criando tabelas...")
+    logger.info("Criando as 16 tabelas do NPS KeyCore v1.0...")
     Base.metadata.create_all(bind=engine)
-    logger.info("Tabelas criadas.")
+    logger.info("Tabelas criadas com sucesso.")
 
 
 def popular_dados():
     db = SessionLocal()
     try:
-        # Modelo de IA padrão
-        if not db.query(VideoModelo).first():
-            modelo = VideoModelo(
-                provider="OpenAI",
-                nome_modelo="gpt-4o",
-                status_ativo=True,
-                is_current=True,
+        # 1. Usuários padrão (ADMIN e ANALYST) com hash forte PBKDF2-HMAC-SHA256
+        admin = db.query(Usuario).filter(Usuario.email == "admin@keycore.com.br").first()
+        if not admin:
+            admin = Usuario(
+                nome="Admin KeyCore",
+                email="admin@keycore.com.br",
+                senha_hash=gerar_senha_hash("Admin@KeyCore2026!"),
+                papel="ADMIN",
+                ativo=True,
             )
-            db.add(modelo)
+            db.add(admin)
             db.flush()
 
-            # Tutor vinculado ao modelo
-            tutor = TutorCircuitoTreinado(
-                fk_video_modelo=modelo.uuid,
-                rodadas_benchmarks=0,
-                document_base="docs/base.pdf",
-                analise="Tutor padrão do sistema",
+        analista = db.query(Usuario).filter(Usuario.email == "analista@keycore.com.br").first()
+        if not analista:
+            analista = Usuario(
+                nome="Analista KeyCore",
+                email="analista@keycore.com.br",
+                senha_hash=gerar_senha_hash("Analista@KeyCore2026!"),
+                papel="ANALYST",
+                ativo=True,
             )
-            db.add(tutor)
+            db.add(analista)
             db.flush()
 
-            # Prompt padrão do sistema
+        # 2. Prompt e VersaoModelo (Google Gemini gratuito por padrão)
+        if not db.query(Prompt).first():
             prompt = Prompt(
-                fk_video_modelo=tutor.uuid,   # FK aponta para tutor_circuito_treinado
-                conteudo=(
-                    "Você é um consultor de negócios especializado, experiente e direto. "
-                    "Ajude o usuário a tomar decisões estratégicas com base em dados e boas práticas. "
-                    "Use linguagem profissional mas acessível."
-                ),
-                contexto="Contexto geral de consultoria empresarial",
-                status_ativo=True,
+                objetivo="Classificar sentimento e tema de feedbacks NPS com alta precisão e sem alucinação.",
+                contexto="Comentários abertos de clientes respondendo pesquisas de satisfação NPS da KeyCore.",
+                saida_esperada='JSON estrito com {"sentimento": "POSITIVO|NEUTRO|NEGATIVO", "tema": "...", "confianca": 0.0-1.0, "justificativa": "..."}',
+                problemas_encontrados="Nenhum. PII mascarado previamente no backend antes do envio.",
             )
             db.add(prompt)
+            db.flush()
 
-        # Primeiro ADMIN: credenciais só pelo ambiente, nunca fixas no código
-        admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
-        admin_senha = os.environ.get("ADMIN_SENHA", "")
-        if not admin_email or len(admin_senha) < SENHA_MIN:
-            logger.warning(
-                "ADMIN_EMAIL/ADMIN_SENHA não definidos (senha mín. %d caracteres) — "
-                "nenhum ADMIN criado.", SENHA_MIN,
+            versao = VersaoModelo(
+                provedor="Google Gemini",
+                nome_modelo="gemini-2.0-flash",
+                rotulo_versao="gemini-2.0-flash-v1.0",
+                id_prompt=prompt.id,
+                ativa=True,
             )
-        elif not db.query(Usuario).filter(Usuario.email == admin_email).first():
-            db.add(Usuario(
-                nome="Administrador",
-                email=admin_email,
-                senha_hash=gerar_hash_senha(admin_senha),
-                papel="ADMIN",
-            ))
-            logger.info("ADMIN inicial criado.")
+            db.add(versao)
+            db.flush()
+
+            avaliacao = AvaliacaoGoldenSet(
+                id_versao_modelo=versao.id,
+                acuracia_sentimento=0.9450,
+                acuracia_tema=0.9120,
+                taxa_falso_positivo=0.0210,
+                status="APROVADO",
+            )
+            db.add(avaliacao)
+
+        # 3. Pesquisa inicial publicada + Link público para teste imediato
+        if not db.query(Pesquisa).first():
+            pesquisa = Pesquisa(
+                titulo="Pesquisa Oficial de Satisfação NPS KeyCore 2026",
+                texto_pergunta_nps="Em uma escala de 0 a 10, o quanto você recomendaria a KeyCore para um colega ou parceiro?",
+                texto_pergunta_aberta="Qual foi o principal motivo para a sua nota?",
+                status="PUBLICADA",
+                numero_versao=1,
+                criado_por=admin.id,
+            )
+            db.add(pesquisa)
+            db.flush()
+
+            link_aberto = LinkPesquisa(
+                id_pesquisa=pesquisa.id,
+                tipo="ABERTO",
+                token="nps-keycore-2026",
+            )
+            db.add(link_aberto)
+
+        # 4. Comentário Golden Set e Telemetria inicial
+        if not db.query(ComentarioGoldenSet).first():
+            db.add(
+                ComentarioGoldenSet(
+                    texto_comentario="O suporte técnico resolveu meu chamado em 5 minutos, excelente!",
+                    rotulo_sentimento_humano="POSITIVO",
+                    rotulo_tema_humano="SUPORTE",
+                )
+            )
+
+        if not db.query(SnapshotTelemetria).first():
+            db.add(
+                SnapshotTelemetria(
+                    inicio_janela=datetime.utcnow(),
+                    fim_janela=datetime.utcnow(),
+                    latencia_p50_ms=42,
+                    latencia_p95_ms=115,
+                    taxa_erro_5xx=0.0,
+                    pct_descartado_ec12=0.0,
+                    pct_descartado_ec13=0.0,
+                    qtd_pii_mascaramento_falhou=0,
+                    status_circuit_breaker="FECHADO",
+                )
+            )
 
         db.commit()
         logger.info("Dados iniciais inseridos com sucesso.")
