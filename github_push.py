@@ -3,12 +3,11 @@ Script para fazer upload de todos os arquivos do projeto para o GitHub via API R
 Usa apenas bibliotecas padrão do Python (urllib + json + base64).
 
 Uso:
-    GITHUB_TOKEN=... python github_push.py
-    (sem a variável, o token é pedido no terminal, sem aparecer na tela)
+    python github_push.py --token SEU_TOKEN_AQUI
+    ou defina a variável de ambiente GITHUB_TOKEN antes de rodar.
 """
 import argparse
 import base64
-import getpass
 import json
 import os
 import sys
@@ -21,22 +20,17 @@ OWNER = "PortoCya"
 REPO = "Banco_PORTO_2026"
 BRANCH = "main"
 API_BASE = f"https://api.github.com/repos/{OWNER}/{REPO}"
-TIMEOUT_SEGUNDOS = 30
 
 # Arquivos/pastas a ignorar no upload
 IGNORAR = {
     ".git", "__pycache__", "venv", "env", ".venv",
-    ".env", "*.db", "*.sqlite", "*.sqlite3", "*.pyc", "*.pem", "*.key",
-    "node_modules",
+    ".env", "*.db", "*.sqlite", "*.pyc"
 }
-
-# Arquivos ocultos que devem subir mesmo começando com "."
-OCULTOS_PERMITIDOS = {".env.example", ".gitignore"}
 
 
 def deve_ignorar(path: Path) -> bool:
     name = path.name
-    if name.startswith(".") and name not in OCULTOS_PERMITIDOS:
+    if name.startswith(".") and name not in {".env.example", ".gitignore"}:
         return True
     for pat in IGNORAR:
         if pat.startswith("*"):
@@ -62,7 +56,7 @@ def api_request(url: str, method: str, token: str, data: dict = None) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SEGUNDOS) as resp:
+        with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8")
@@ -139,13 +133,13 @@ def collect_files(root: Path):
 
 
 def main():
-    # Sem --token: argumento de linha de comando fica no histórico do shell
-    # e visível para outros processos (ps).
-    argparse.ArgumentParser(description="Upload projeto para GitHub via API").parse_args()
+    parser = argparse.ArgumentParser(description="Upload projeto para GitHub via API")
+    parser.add_argument("--token", help="GitHub Personal Access Token")
+    args = parser.parse_args()
 
-    token = os.environ.get("GITHUB_TOKEN") or getpass.getpass("GitHub token: ").strip()
+    token = args.token or os.environ.get("GITHUB_TOKEN")
     if not token:
-        print("ERRO: Forneça o token pela variavel GITHUB_TOKEN ou digite quando pedido")
+        print("ERRO: Forneça o token via --token ou variavel GITHUB_TOKEN")
         print("       Crie em: https://github.com/settings/tokens")
         print("       Permissoes necessarias: repo (read/write contents)")
         sys.exit(1)
