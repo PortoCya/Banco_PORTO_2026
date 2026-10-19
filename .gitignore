@@ -1,35 +1,50 @@
-# Segredos
-.env
-.env.*
-!.env.example
-*.pem
-*.key
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
 
-# Banco local
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Environment variables (NUNCA commitar .env com secrets)
+.env
+
+# Banco de dados SQLite gerado localmente
 *.db
 *.sqlite
 *.sqlite3
 
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-*.egg-info/
+# Logs
+*.log
+logs/
+
+# Distribuição / packaging
 dist/
 build/
+*.egg-info/
+*.egg
 
-# Node / Next.js
-node_modules/
-.next/
-out/
-
-# Editores / SO
+# IDEs
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# mypy
+.mypy_cache/
+
+# Alembic (não versionar banco gerado)
+alembic/versions/*.pyc
