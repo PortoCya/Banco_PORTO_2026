@@ -42,6 +42,19 @@ def test_login_erro_generico(client):
     assert senha_errada.json() == inexistente.json() == inativo.json()
 
 
+def test_me_retorna_usuario_sem_hash(client):
+    criar_usuario("a@x.com", papel="ADMIN")
+    r = client.get("/api/v1/auth/me", headers=auth_header(token(client, "a@x.com")))
+    assert r.status_code == 200
+    assert r.json()["email"] == "a@x.com"
+    assert r.json()["papel"] == "ADMIN"
+    assert "senha_hash" not in r.json()
+
+
+def test_me_sem_token(client):
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
 def test_validacao_nao_vaza_senha(client, caplog):
     senha = "senha-secreta-" + "y" * 200   # passa do máximo → 422
     with caplog.at_level(logging.DEBUG):

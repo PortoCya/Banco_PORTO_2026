@@ -6,13 +6,14 @@ import logging
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_usuario_atual
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.errors import TooManyRequestsError, UnauthorizedError
 from app.core.rate_limit import RateLimiter
 from app.core.security import criar_token_acesso, gerar_hash_senha, precisa_rehash, verificar_senha
 from app.models.models import Usuario
-from app.schemas.schemas import LoginRequest, TokenResponse
+from app.schemas.schemas import LoginRequest, TokenResponse, UsuarioResponse
 
 logger = logging.getLogger(__name__)
 
@@ -68,3 +69,17 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
         access_token=criar_token_acesso(usuario.uuid),
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
+
+
+@router.get(
+    "/auth/me",
+    response_model=UsuarioResponse,
+    summary="Usuário logado",
+    tags=["Autenticação"],
+)
+def usuario_logado(usuario: Usuario = Depends(get_usuario_atual)):
+    """
+    **Retorna:** dados do usuário dono do token (papel e ativo lidos do banco)
+    **Códigos:** 200 OK | 401 Unauthorized
+    """
+    return usuario

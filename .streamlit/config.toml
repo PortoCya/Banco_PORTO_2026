@@ -1,0 +1,15 @@
+# Tema do dashboard (dashboard/nps_dashboard.py).
+# Sem "base" definido, o app segue o tema do sistema e o usuário troca em
+# ⋮ > Settings. Para forçar um tema: streamlit run ... --theme.base light
+
+[theme.light]
+primaryColor = "#6C5CE7"
+backgroundColor = "#F4F4F5"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2937"
+
+[theme.dark]
+primaryColor = "#8B7CF6"
+backgroundColor = "#0F1117"
+secondaryBackgroundColor = "#1A1C23"
+textColor = "#E5E7EB"
