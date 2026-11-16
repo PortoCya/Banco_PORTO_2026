@@ -43,6 +43,12 @@ def popular_dados():
             )
             db.add(admin)
             db.flush()
+        else:
+            # Seed de desenvolvimento: garante que as credenciais documentadas funcionem localmente.
+            admin.nome = "Admin KeyCore"
+            admin.senha_hash = gerar_senha_hash("Admin@KeyCore2026!")
+            admin.papel = "ADMIN"
+            admin.ativo = True
 
         analista = db.query(Usuario).filter(Usuario.email == "analista@keycore.com.br").first()
         if not analista:
@@ -86,10 +92,12 @@ def popular_dados():
             )
             db.add(avaliacao)
 
-        # 3. Pesquisa inicial publicada + Link público para teste imediato
-        if not db.query(Pesquisa).first():
+        # 3. Pesquisa publicada e link aberto estável para teste imediato
+        titulo_pesquisa_teste = "Pesquisa Oficial de Satisfação NPS KeyCore 2026"
+        pesquisa = db.query(Pesquisa).filter(Pesquisa.titulo == titulo_pesquisa_teste).first()
+        if not pesquisa:
             pesquisa = Pesquisa(
-                titulo="Pesquisa Oficial de Satisfação NPS KeyCore 2026",
+                titulo=titulo_pesquisa_teste,
                 texto_pergunta_nps="Em uma escala de 0 a 10, o quanto você recomendaria a KeyCore para um colega ou parceiro?",
                 texto_pergunta_aberta="Qual foi o principal motivo para a sua nota?",
                 status="PUBLICADA",
@@ -98,13 +106,31 @@ def popular_dados():
             )
             db.add(pesquisa)
             db.flush()
+        else:
+            pesquisa.status = "PUBLICADA"
 
-            link_aberto = LinkPesquisa(
-                id_pesquisa=pesquisa.id,
-                tipo="ABERTO",
-                token="nps-keycore-2026",
-            )
-            db.add(link_aberto)
+        token_teste = "nps-keycore-2026"
+        link_aberto = db.query(LinkPesquisa).filter(
+            LinkPesquisa.id_pesquisa == pesquisa.id,
+            LinkPesquisa.token == token_teste,
+        ).first()
+        if not link_aberto:
+            sufixo = 2
+            while True:
+                token_ocupado = db.query(LinkPesquisa).filter(LinkPesquisa.token == token_teste).first()
+                if not token_ocupado:
+                    link_aberto = LinkPesquisa(
+                        id_pesquisa=pesquisa.id,
+                        tipo="ABERTO",
+                        token=token_teste,
+                    )
+                    db.add(link_aberto)
+                    break
+                if token_ocupado.id_pesquisa == pesquisa.id and token_ocupado.tipo == "ABERTO":
+                    link_aberto = token_ocupado
+                    break
+                token_teste = f"nps-keycore-2026-{sufixo}"
+                sufixo += 1
 
         # 4. Comentário Golden Set e Telemetria inicial
         if not db.query(ComentarioGoldenSet).first():
@@ -133,6 +159,8 @@ def popular_dados():
 
         db.commit()
         logger.info("Dados iniciais inseridos com sucesso.")
+        logger.info("Acesso ADMIN de desenvolvimento: admin@keycore.com.br")
+        logger.info("Link público de teste: /pesquisa/%s", token_teste)
 
     except Exception as exc:
         db.rollback()
