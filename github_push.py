@@ -20,6 +20,7 @@ OWNER = "PortoCya"
 REPO = "Banco_PORTO_2026"
 BRANCH = "main"
 API_BASE = f"https://api.github.com/repos/{OWNER}/{REPO}"
+TIMEOUT_SEGUNDOS = 30  # toda chamada externa tem timeout explícito
 
 # Arquivos/pastas a ignorar no upload
 IGNORAR = {
@@ -56,7 +57,7 @@ def api_request(url: str, method: str, token: str, data: dict = None) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SEGUNDOS) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8")

@@ -16,6 +16,8 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 MODELO = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Toda chamada externa tem timeout explícito (em milissegundos no SDK)
+TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "30000"))
 
 SYSTEM_INSIGHTS = (
     "Você é um analista de Customer Experience especialista em NPS. "
@@ -63,7 +65,7 @@ def _client() -> genai.Client:
             "Chave do Gemini não encontrada. Defina GEMINI_API_KEY "
             "(variável de ambiente ou .streamlit/secrets.toml)."
         )
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=TIMEOUT_MS))
 
 
 @st.cache_data(ttl=600, show_spinner=False)
