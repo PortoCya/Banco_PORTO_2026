@@ -180,6 +180,24 @@ class RespostaPublicaResponse(BaseModel):
     criada_em: datetime
 
 
+class RespostaResponse(BaseModel):
+    """
+    Uma resposta VALIDA para os painéis. Comentário sempre anonimizado (PII
+    mascarada). Os campos de análise são a análise SUGERIDA mais recente pela
+    IA (nulos se ainda não houver): nunca alteram nota, faixa ou NPS.
+    """
+    id: uuid.UUID
+    nota_nps: int
+    faixa_nps: Literal["PROMOTOR", "NEUTRO", "DETRATOR"]
+    texto_comentario: Optional[str]
+    criada_em: datetime
+    status_analise: Optional[str] = None
+    sentimento: Optional[str] = None
+    tema: Optional[str] = None
+    confianca: Optional[float] = None
+    justificativa: Optional[str] = None
+
+
 # ─── NPS ─────────────────────────────────────────────────────────────────────
 
 class NpsResponse(BaseModel):

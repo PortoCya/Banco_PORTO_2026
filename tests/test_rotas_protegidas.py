@@ -31,6 +31,7 @@ ANALYST_PODE = {
     ("get", "/api/v1/pesquisas/{id_pesquisa}"),
     ("get", "/api/v1/pesquisas/{id_pesquisa}/nps"),
     ("get", "/api/v1/pesquisas/{id_pesquisa}/nps/historico"),
+    ("get", "/api/v1/pesquisas/{id_pesquisa}/respostas"),
     ("get", "/api/v1/pesquisas/{id_pesquisa}/exportacao"),
     ("get", "/api/v1/pesquisas/{id_pesquisa}/analises-feedback"),
     ("get", "/api/v1/pesquisas/{id_pesquisa}/analises-feedback/resumo"),

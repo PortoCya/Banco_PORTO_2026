@@ -63,6 +63,15 @@ def _inicio_do_dia(d: date) -> datetime:
     return datetime.combine(d, time.min, tzinfo=timezone.utc)
 
 
+def filtrar_periodo(consulta, periodo_inicio: Optional[date], periodo_fim: Optional[date]):
+    """Restringe a submissões criadas entre os dois dias (UTC), inclusive."""
+    if periodo_inicio:
+        consulta = consulta.where(Submissao.criada_em >= _inicio_do_dia(periodo_inicio))
+    if periodo_fim:
+        consulta = consulta.where(Submissao.criada_em < _inicio_do_dia(periodo_fim + timedelta(days=1)))
+    return consulta
+
+
 def nps_da_pesquisa(
     db: Session,
     id_pesquisa: uuid.UUID,
@@ -75,10 +84,7 @@ def nps_da_pesquisa(
         func.coalesce(func.sum(case((Submissao.nota_nps.between(7, 8), 1), else_=0)), 0),
         func.coalesce(func.sum(case((Submissao.nota_nps <= 6, 1), else_=0)), 0),
     ).where(Submissao.id_pesquisa == id_pesquisa, Submissao.status == "VALIDA")
-    if periodo_inicio:
-        consulta = consulta.where(Submissao.criada_em >= _inicio_do_dia(periodo_inicio))
-    if periodo_fim:
-        consulta = consulta.where(Submissao.criada_em < _inicio_do_dia(periodo_fim + timedelta(days=1)))
+    consulta = filtrar_periodo(consulta, periodo_inicio, periodo_fim)
     promotores, neutros, detratores = db.execute(consulta).one()
     return ResultadoNps(int(promotores), int(neutros), int(detratores))
 

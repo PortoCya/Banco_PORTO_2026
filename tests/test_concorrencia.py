@@ -103,6 +103,7 @@ def test_listagens_nao_tem_n_mais_1(client, admin):
         f"/api/v1/pesquisas/{id_pesquisa}/exportacao",
         f"/api/v1/pesquisas/{id_pesquisa}/nps",
         f"/api/v1/pesquisas/{id_pesquisa}/nps/historico",
+        f"/api/v1/pesquisas/{id_pesquisa}/respostas",
         "/api/v1/pesquisas",
         "/api/v1/ia/jobs",
         "/api/v1/log-auditoria",

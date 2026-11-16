@@ -18,14 +18,15 @@ from app.api.deps import Paginacao, paginacao, requer_papel
 from app.core.database import SessionLocal, get_db
 from app.core.errors import ConflictError, ForbiddenError, InvalidInputError, NotFoundError
 from app.models.models import (
-    LinkPesquisa, LogExportacao, Pesquisa, SnapshotNps, Submissao, Usuario,
+    AnaliseFeedback, LinkPesquisa, LogExportacao, Pesquisa, SnapshotNps, Submissao, Usuario,
 )
 from app.schemas.schemas import (
     LinkPesquisaCreate, LinkPesquisaResponse, NpsResponse, PesquisaCreate,
-    PesquisaResponse, PesquisaUpdate, SnapshotNpsResponse, StatusPesquisa,
+    PesquisaResponse, PesquisaUpdate, RespostaResponse, SnapshotNpsResponse, StatusPesquisa,
 )
 from app.services.auditoria import estado_pesquisa, registrar_auditoria
-from app.services.nps import faixa_nps, nps_da_pesquisa
+from app.services.analises import ultima_sequencia
+from app.services.nps import faixa_nps, filtrar_periodo, nps_da_pesquisa
 from app.services.pii import texto_anonimizado
 
 router = APIRouter(tags=["Pesquisas"])
@@ -288,6 +289,54 @@ def nps_historico(
         .order_by(SnapshotNps.periodo_fim.desc())
         .limit(limit)
     ).scalars().all()
+
+
+@router.get("/pesquisas/{id_pesquisa}/respostas", response_model=List[RespostaResponse],
+            summary="Respostas da pesquisa para os painéis (comentário anonimizado)",
+            dependencies=[Depends(_leitura)])
+def listar_respostas(
+    id_pesquisa: uuid.UUID,
+    periodo_inicio: Optional[date] = None,
+    periodo_fim: Optional[date] = None,
+    skip: int = Query(0, ge=0, le=1_000_000),
+    limit: int = Query(500, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    """
+    Só respostas VALIDAS, da mais recente para a mais antiga, com a análise
+    sugerida vigente (uma consulta, sem N+1). O comentário sai sempre com PII
+    mascarada — para dados identificados, ADMIN usa a exportação, que é auditada.
+
+    **Códigos:** 200 | 401 | 403 | 404 | 422
+    """
+    _buscar_pesquisa(db, id_pesquisa)
+    if periodo_inicio and periodo_fim and periodo_inicio > periodo_fim:
+        raise InvalidInputError("periodo_inicio não pode ser depois de periodo_fim.")
+    ultima = ultima_sequencia()
+    consulta = (
+        select(Submissao, AnaliseFeedback)
+        .outerjoin(ultima, ultima.c.id_submissao == Submissao.id)
+        .outerjoin(AnaliseFeedback, (AnaliseFeedback.id_submissao == Submissao.id)
+                   & (AnaliseFeedback.sequencia_versao == ultima.c.sequencia))
+        .where(Submissao.id_pesquisa == id_pesquisa, Submissao.status == "VALIDA")
+    )
+    consulta = filtrar_periodo(consulta, periodo_inicio, periodo_fim)
+    consulta = consulta.order_by(Submissao.criada_em.desc(), Submissao.id).offset(skip).limit(limit)
+    return [
+        RespostaResponse(
+            id=s.id,
+            nota_nps=s.nota_nps,
+            faixa_nps=faixa_nps(s.nota_nps),
+            texto_comentario=texto_anonimizado(s.texto_comentario),
+            criada_em=s.criada_em,
+            status_analise=a.status if a else None,
+            sentimento=a.sentimento if a else None,
+            tema=a.tema if a else None,
+            confianca=a.confianca if a else None,
+            justificativa=a.justificativa if a else None,
+        )
+        for s, a in db.execute(consulta)
+    ]
 
 
 # ══════════════════════════════════════════════════════════════════

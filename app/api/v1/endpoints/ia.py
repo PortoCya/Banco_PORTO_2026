@@ -30,6 +30,7 @@ from app.schemas.schemas import (
     VersaoModeloCreate, VersaoModeloResponse,
 )
 from app.services import custo_ia, fila
+from app.services.analises import ultima_sequencia
 from app.services.auditoria import estado_versao_modelo, registrar_auditoria
 from app.services.pii import texto_anonimizado
 
@@ -41,18 +42,6 @@ _leitura = requer_papel("ADMIN", "ANALYST")
 
 _TAG_ANALISES = ["IA — análises sugeridas"]
 _TAG_GESTAO = ["IA — gestão (ADMIN)"]
-
-
-def _ultima_sequencia():
-    """Subconsulta: a maior sequencia_versao de cada submissão (a análise vigente)."""
-    return (
-        select(
-            AnaliseFeedback.id_submissao.label("id_submissao"),
-            func.max(AnaliseFeedback.sequencia_versao).label("sequencia"),
-        )
-        .group_by(AnaliseFeedback.id_submissao)
-        .subquery()
-    )
 
 
 def _exigir_pesquisa(db: Session, id_pesquisa: uuid.UUID) -> None:
@@ -98,7 +87,7 @@ def listar_analises(
     sai com PII mascarada. **Códigos:** 200 | 401 | 403 | 404 | 422
     """
     _exigir_pesquisa(db, id_pesquisa)
-    ultima = _ultima_sequencia()
+    ultima = ultima_sequencia()
     consulta = (
         select(AnaliseFeedback, Submissao.nota_nps, Submissao.texto_comentario)
         .join(Submissao, Submissao.id == AnaliseFeedback.id_submissao)
@@ -122,7 +111,7 @@ def listar_analises(
 def resumo_analises(id_pesquisa: uuid.UUID, db: Session = Depends(get_db)):
     """BAIXA_CONFIANCA, descartadas e falhas ficam fora das contagens. **Códigos:** 200 | 401 | 403 | 404"""
     _exigir_pesquisa(db, id_pesquisa)
-    ultima = _ultima_sequencia()
+    ultima = ultima_sequencia()
     linhas = db.execute(
         select(AnaliseFeedback.sentimento, AnaliseFeedback.tema, func.count())
         .join(Submissao, Submissao.id == AnaliseFeedback.id_submissao)

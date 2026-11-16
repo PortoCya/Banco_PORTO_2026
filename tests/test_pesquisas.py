@@ -206,3 +206,38 @@ def test_log_auditoria_filtra_e_pagina(client, admin):
     assert client.get("/api/v1/log-auditoria?limit=1", headers=admin).json()[0]["acao"] == "PUBLICAR_PESQUISA"
     assert client.get("/api/v1/log-auditoria?acao=x';DROP TABLE usuario;--", headers=admin).status_code == 422
     assert client.get("/api/v1/log-auditoria?de=2026-01-01T00:00:00", headers=admin).status_code == 422
+
+
+# ─── Respostas para os painéis ───────────────────────────────────────────────
+
+def test_respostas_para_paineis_anonimizadas_com_analise_vigente(client, analyst):
+    from app.models.models import AnaliseFeedback, JobIa
+    from tests.conftest import criar_versao_modelo
+    id_versao = criar_versao_modelo(ativo=True)
+    id_pesquisa, tok = criar_pesquisa()
+    responder(client, tok, 3, "Atrasou. Meu CPF é 123.456.789-00")
+    responder(client, tok, 10)
+    with SessionLocal() as db:
+        job = db.query(JobIa).one()
+        for seq, tema in ((1, "produto"), (2, "prazo")):            # reanálise: vale a mais recente
+            db.add(AnaliseFeedback(id_submissao=job.id_submissao, id_versao_modelo=id_versao, sequencia_versao=seq,
+                                   sentimento="NEGATIVO", tema=tema, confianca=0.9, status="CONCLUIDA"))
+        db.commit()
+
+    r = client.get(f"{BASE}/{id_pesquisa}/respostas", headers=analyst)
+    assert r.status_code == 200
+    itens = r.json()
+    assert [(i["nota_nps"], i["faixa_nps"]) for i in itens] == [(10, "PROMOTOR"), (3, "DETRATOR")]
+    assert "123.456.789-00" not in r.text and "[CPF]" in itens[1]["texto_comentario"]
+    assert (itens[1]["tema"], itens[1]["status_analise"]) == ("prazo", "CONCLUIDA")
+    assert itens[0]["status_analise"] is None and itens[0]["texto_comentario"] is None
+    assert "endereco_ip" not in itens[0] and "chave_idempotencia" not in itens[0]
+
+
+def test_respostas_para_paineis_ignoram_bloqueadas_e_validam_parametros(client, analyst):
+    id_pesquisa, tok = criar_pesquisa(tipo_link="NOMINAL")
+    responder(client, tok, 10)
+    responder(client, tok, 0)                                       # bloqueada: fora da lista
+    assert len(client.get(f"{BASE}/{id_pesquisa}/respostas", headers=analyst).json()) == 1
+    for q in ("limit=5000", "skip=-1", "periodo_inicio=2026-02-01&periodo_fim=2026-01-01"):
+        assert client.get(f"{BASE}/{id_pesquisa}/respostas?{q}", headers=analyst).status_code == 422
