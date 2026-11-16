@@ -33,6 +33,8 @@ Front (Next.js) ──HTTP──▶ API (FastAPI) ──▶ PostgreSQL ◀──
 | `alembic/` | Migrations versionadas |
 | `scripts/` | Backup, teste de restore, permissões do usuário de banco do worker |
 | `tests/` | pytest |
+| `frontend/` | Next.js: login, painel ADMIN de pesquisas e página pública de resposta |
+| `dashboard/` | Painel de análise (Streamlit) para ANALYST/ADMIN, lendo da API |
 
 ## Rodando em desenvolvimento
 
@@ -68,6 +70,24 @@ Sem Docker: suba um PostgreSQL e um Redis, aponte `DATABASE_URL`/`REDIS_URL`,
 rode `alembic upgrade head`, `scripts/permissoes_worker.sql` e, em outro
 terminal, `python -m app.ia.worker`.
 
+## Front (Next.js) e dashboard
+
+Os dois só falam com a API — nada de banco ou provedor de IA direto.
+
+```bash
+# Front: login, /admin/pesquisas (ADMIN) e /pesquisa/{token} (respondente, sem login)
+cd frontend && cp .env.local.example .env.local   # NEXT_PUBLIC_API_URL=http://localhost:8000
+npm ci && npm run dev                              # http://localhost:3000
+
+# Dashboard de análise (ANALYST ou ADMIN)
+pip install -r requirements-dashboard.txt
+NPS_API_URL=http://localhost:8000 streamlit run dashboard/nps_dashboard.py
+```
+
+- A API precisa liberar a origem do front: `CORS_ORIGINS=http://localhost:3000`.
+- Em desenvolvimento sem HTTPS use `COOKIE_SECURE=false` (senão o cookie do link aberto não é gravado).
+- O NPS exibido vem da API. A análise sugerida (sentimento e tema) é feita pelo worker de IA; o dashboard só mostra.
+
 ## Testes
 
 ```bash
@@ -91,6 +111,7 @@ O banco apontado por `TEST_DATABASE_URL` é **apagado e recriado** a cada teste.
 | POST/GET | `/pesquisas/{id}/links` | ADMIN |
 | GET/POST | `/public/respostas/{token}` | público (rate limit por IP) |
 | GET | `/pesquisas/{id}/nps` · `/nps/historico` | ANALYST/ADMIN |
+| GET | `/pesquisas/{id}/respostas` (para os painéis, comentário anonimizado) | ANALYST/ADMIN |
 | GET | `/pesquisas/{id}/exportacao` | ANALYST (anonimizado) / ADMIN |
 | GET | `/pesquisas/{id}/analises-feedback` · `/analises-feedback/resumo` | ANALYST/ADMIN |
 | PATCH | `/analises-feedback/{id}` | ANALYST |
