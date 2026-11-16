@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+venv
+.venv
+__pycache__
+*.db
+backups
+frontend
+dashboard
+tests
