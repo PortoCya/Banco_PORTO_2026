@@ -1,21 +1,23 @@
 """
 Dashboard NPS KeyCore (Streamlit + Plotly) - responsivo, tema claro e escuro
 
+Lê tudo da API (nada de banco ou IA direto daqui): entre com um usuário
+ANALYST ou ADMIN. O NPS vem do backend; a análise sugerida (sentimento e
+tema) é feita pelo worker de IA e só aparece aqui como sugestão.
+
 Instalar:  pip install -r requirements-dashboard.txt
-Rodar:     streamlit run dashboard/nps_dashboard.py   (a partir da raiz do projeto,
-           para pegar o tema de .streamlit/config.toml)
+Rodar:     NPS_API_URL=http://localhost:8000 streamlit run dashboard/nps_dashboard.py
+           (a partir da raiz do projeto, para pegar o tema de .streamlit/config.toml)
 """
+from datetime import date, timedelta
 from html import escape
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from gemini_service import (
-    LIMITE_POR_EXECUCAO, MODELO, PROMPT_VERSAO, analisar_comentarios, ia_configurada,
-)
+from api_cliente import API_URL, ClienteApi, ErroApi, nps_inteiro
 
 st.set_page_config(page_title="NPS", layout="wide")
 
@@ -116,188 +118,109 @@ PLOT_LAYOUT = dict(
 PLOT_CFG = {"displayModeBar": False, "responsive": True}
 
 
-# ---------------------------------------------------------------- dados
-def calc_nps(promoters: int, passives: int, detractors: int) -> float:
-    total = promoters + passives + detractors
-    return round((promoters - detractors) / total * 100, 1) if total else 0.0
-
-
+# ---------------------------------------------------------------- rótulos
 SENT_COLOR = {"Positivo": GREEN, "Neutro": MUTED, "Negativo": RED}
 FAIXA_COLOR = {"Promotor": GREEN, "Neutro": MUTED, "Detrator": RED}
-
-# Comentários de exemplo por faixa. Os detratores e neutros cobrem as classes de
-# problema da IA (valor, sistema, demora, cobrança indevida, outros).
-_COMENTARIOS = {
-    "Promotor": [
-        "Atendimento excelente, resolveram meu problema no mesmo dia.",
-        "A plataforma é muito fácil de usar, recomendo para todo mundo.",
-        "Entrega antes do prazo e produto de ótima qualidade.",
-        "Suporte rápido e atencioso, superou minhas expectativas.",
-        "Melhor custo-benefício que já encontrei no mercado.",
-        "Uso todos os dias no trabalho e nunca me deixou na mão.",
-        "O time de suporte é muito educado e explica tudo com paciência.",
-        "Os relatórios novos ajudaram muito a minha equipe.",
-        "Migrar para a KeyCore foi a melhor decisão do ano.",
-        "Aplicativo rápido, bonito e sem travamentos.",
-        "Gostei muito da transparência na cobrança, sem surpresas na fatura.",
-        "Resolveram uma dúvida complexa em poucos minutos pelo chat.",
-        "Produto confiável, já indiquei para dois parceiros.",
-        "A implantação foi tranquila e bem acompanhada.",
-        "Preço justo pelo que entrega, vale cada centavo.",
-        "Adoro as atualizações frequentes, sempre trazem algo útil.",
-        "Atendimento humanizado, me senti muito bem tratado.",
-        "Tudo funciona como prometido, sem complicação.",
-    ],
-    "Neutro": [
-        "Bom produto, mas o preço poderia ser menor.",
-        "Funciona bem, porém a interface é um pouco confusa.",
-        "O prazo de entrega atrasou alguns dias.",
-        "Atende ao básico, sem grandes diferenciais.",
-        "Gosto do sistema, mas às vezes fica lento no fim do mês.",
-        "O suporte resolve, mas demora um pouco para responder.",
-        "O plano ficou mais caro depois do reajuste.",
-        "Falta integração com outras ferramentas que usamos.",
-        "Bom no geral, mas o aplicativo trava de vez em quando.",
-        "Vi uma taxa na fatura que não entendi direito.",
-        "Poderiam ter mais opções de relatório.",
-        "Cumpre o que promete, nada além disso.",
-        "A documentação é fraca, tive que pedir ajuda para configurar.",
-        "Atendimento educado, mas precisei explicar o problema três vezes.",
-    ],
-    "Detrator": [
-        "Demoraram uma semana para responder meu chamado.",
-        "O sistema caiu várias vezes durante o mês.",
-        "Cobrança indevida e ninguém resolve.",
-        "Produto chegou com defeito e a troca foi um sofrimento.",
-        "Muito caro para o que entrega.",
-        "Fui cobrado duas vezes no mesmo mês e o estorno não saiu.",
-        "Cancelei o plano e continuaram cobrando no cartão.",
-        "Apareceu um serviço na fatura que eu nunca contratei.",
-        "O aplicativo fecha sozinho toda vez que tento salvar.",
-        "Perdi dados importantes depois de uma atualização do sistema.",
-        "A plataforma fica fora do ar justo no horário de pico.",
-        "O login dá erro quase todo dia.",
-        "Esperei mais de uma hora na fila do atendimento.",
-        "A entrega atrasou quinze dias e ninguém avisou nada.",
-        "Abri o chamado há um mês e continua sem solução.",
-        "O reajuste foi absurdo, quase dobrou o valor da mensalidade.",
-        "Pelo preço que pago esperava muito mais.",
-        "A concorrência oferece o mesmo pela metade do valor.",
-        "O atendente foi grosso e desligou na minha cara.",
-        "Prometeram uma funcionalidade na venda que não existe.",
-        "Não consigo falar com ninguém, só robô respondendo.",
-        "O contrato tem cláusulas escondidas que ninguém explicou.",
-    ],
-}
-_CHANCE_COMENTARIO = 0.8   # o resto responde só a nota
-DIAS_HISTORICO = 180       # o mock cobre 180 dias: período atual + anterior
-DIAS_PERIODO = {"Últimos 7 dias": 7, "Últimos 30 dias": 30, "Últimos 90 dias": 90}
-
-
-def faixa_nps(nota: int) -> str:
-    return "Promotor" if nota >= 9 else "Neutro" if nota >= 7 else "Detrator"
-
-
-@st.cache_data
-def load_respostas(seed: int = 11, n: int = 1000) -> pd.DataFrame:
-    """
-    Dados mock das respostas. Troque por consulta ao banco/API.
-
-    As colunas *_ia ficam vazias até a camada de IA existir. Ela vai preencher
-    a análise sugerida (sentimento, tema, confiança, justificativa) sem nunca
-    alterar a nota nem o NPS.
-    """
-    rng = np.random.default_rng(seed)
-    hoje = pd.Timestamp.today().normalize()
-    notas = rng.choice(11, size=n, p=[.03, .02, .03, .03, .04, .05, .07, .10, .13, .20, .30])
-    rows = []
-    for i, nota in enumerate(notas):
-        faixa = faixa_nps(int(nota))
-        rows.append({
-            "id": f"R{i + 1:04d}",
-            "data": hoje - pd.Timedelta(days=int(rng.integers(0, DIAS_HISTORICO))),
-            "nota": int(nota),
-            "faixa": faixa,
-            "comentario": (str(rng.choice(_COMENTARIOS[faixa]))
-                           if rng.random() < _CHANCE_COMENTARIO else ""),
-            "segmento": str(rng.choice(["Empresarial", "PME", "Gratuito"])),
-            "empresa": str(rng.choice(["Empresa A", "Empresa B"])),
-            "sentimento_ia": None,
-            "tema_ia": None,
-            "confianca_ia": None,
-            "justificativa_ia": None,
-            "problema_ia": None,
-            "status_ia": None,
-        })
-    return pd.DataFrame(rows)
-
-
-@st.cache_data
-def load_exibicoes(seed: int = 23) -> pd.DataFrame:
-    """
-    Dados mock: pesquisas exibidas que NÃO viraram resposta (dispensadas ou
-    ignoradas). Total exibido = respostas + estas. Troque por consulta ao banco/API.
-    """
-    rng = np.random.default_rng(seed)
-    hoje = pd.Timestamp.today().normalize()
-    n = int(len(load_respostas()) * 1.8)
-    return pd.DataFrame({
-        "data": [hoje - pd.Timedelta(days=int(d)) for d in rng.integers(0, DIAS_HISTORICO, n)],
-        "segmento": rng.choice(["Empresarial", "PME", "Gratuito"], n),
-        "empresa": rng.choice(["Empresa A", "Empresa B"], n),
-        "resultado": rng.choice(["dispensou", "ignorou"], n, p=[0.4, 0.6]),
-    })
-
-
+FAIXA_LABEL = {"PROMOTOR": "Promotor", "NEUTRO": "Neutro", "DETRATOR": "Detrator"}
 SENTIMENTO_LABEL = {"POSITIVO": "Positivo", "NEUTRO": "Neutro", "NEGATIVO": "Negativo"}
 TEMA_LABEL = {"atendimento": "Atendimento", "preco": "Preço", "produto": "Produto",
               "prazo": "Prazo", "usabilidade": "Usabilidade", "outro": "Outro"}
-PROBLEMA_LABEL = {"valor": "Valor", "sistema": "Sistema", "demora": "Demora",
-                  "cobranca_indevida": "Cobrança indevida", "outros": "Outros"}
 STATUS_IA_LABEL = {"CONCLUIDA": "Concluída", "BAIXA_CONFIANCA": "Baixa confiança",
-                   "FALHA_SCHEMA": "Falha de formato", "PENDENTE": "Pendente"}
+                   "FALHA_SCHEMA": "Falha de formato", "PENDENTE": "Pendente",
+                   "DESCARTADA_MANUAL": "Descartada"}
+DIAS_PERIODO = {"Últimos 7 dias": 7, "Últimos 30 dias": 30, "Últimos 90 dias": 90}
+COLUNAS = ["id", "data", "nota", "faixa", "comentario", "sentimento_ia", "tema_ia",
+           "confianca_ia", "justificativa_ia", "status_ia"]
 
 
-def aplicar_analises(df: pd.DataFrame, analises: dict[str, dict]) -> pd.DataFrame:
-    """Preenche as colunas *_ia com as análises sugeridas já geradas (nota intocada)."""
-    df = df.copy()
-    pega = lambda campo: df["id"].map(lambda i: analises.get(i, {}).get(campo))
-    df["sentimento_ia"] = pega("sentimento").map(SENTIMENTO_LABEL)
-    df["tema_ia"] = pega("tema").map(TEMA_LABEL)
-    df["confianca_ia"] = pega("confianca")
-    df["justificativa_ia"] = pega("justificativa")
-    df["problema_ia"] = pega("problema").map(PROBLEMA_LABEL)
-    df["status_ia"] = pega("status").map(STATUS_IA_LABEL)
-    return df
+# ---------------------------------------------------------------- login
+def tela_login() -> None:
+    st.title("NPS")
+    with st.form("login"):
+        st.caption(f"Entre com seu usuário ANALYST ou ADMIN · API: `{API_URL}`")
+        email = st.text_input("E-mail", max_chars=255)
+        senha = st.text_input("Senha", type="password", max_chars=128)
+        if st.form_submit_button("Entrar", type="primary"):
+            try:
+                api = ClienteApi()
+                usuario = api.login(email, senha)
+            except ErroApi as e:
+                st.error(str(e))
+                return
+            # só o token fica na sessão; a senha não é guardada
+            st.session_state["token"] = api.token
+            st.session_state["usuario"] = usuario
+            st.rerun()
 
 
-def aplicar_filtros(df: pd.DataFrame, seg: str, emp: str, per: str,
-                    anterior: bool = False) -> pd.DataFrame:
-    """Segmento, empresa e janela de datas (o período escolhido ou o imediatamente anterior)."""
-    dias = DIAS_PERIODO[per]
-    fim = pd.Timestamp.today().normalize() - pd.Timedelta(days=dias if anterior else 0)
-    df = df[(df["data"] > fim - pd.Timedelta(days=dias)) & (df["data"] <= fim)]
-    if not seg.startswith("Todos"):
-        df = df[df["segmento"] == seg]
-    if not emp.startswith("Todas"):
-        df = df[df["empresa"] == emp]
-    return df
+def sair() -> None:
+    for chave in ("token", "usuario"):
+        st.session_state.pop(chave, None)
+    st.cache_data.clear()
 
 
+def chamar(funcao, *args):
+    """Chama a API; 401 (token vencido ou usuário desativado) volta ao login."""
+    try:
+        return funcao(*args)
+    except ErroApi as e:
+        if e.status == 401:
+            sair()
+            st.warning("Sua sessão expirou. Entre de novo.")
+            st.rerun()
+        st.error(str(e))
+        st.stop()
+
+
+# ---------------------------------------------------------------- dados (API)
+# Cache curto por token: cada usuário vê só o que a API deixa ele ver.
+@st.cache_data(ttl=60, show_spinner=False)
+def carregar_pesquisas(token: str) -> list[dict]:
+    return ClienteApi(token=token).pesquisas()
+
+
+@st.cache_data(ttl=60, show_spinner="Carregando respostas...")
+def carregar_respostas(token: str, id_pesquisa: str, inicio: date, fim: date) -> pd.DataFrame:
+    itens = ClienteApi(token=token).respostas(id_pesquisa, inicio, fim)
+    if not itens:
+        return pd.DataFrame(columns=COLUNAS)
+    df = pd.DataFrame(itens)
+    return pd.DataFrame({
+        "id": df["id"],
+        # datas da API vêm em UTC; o painel mostra no fuso de São Paulo
+        "data": pd.to_datetime(df["criada_em"], utc=True)
+                  .dt.tz_convert("America/Sao_Paulo").dt.tz_localize(None),
+        "nota": df["nota_nps"].astype(int),
+        "faixa": df["faixa_nps"].map(FAIXA_LABEL),
+        "comentario": df["texto_comentario"].fillna(""),
+        "sentimento_ia": df["sentimento"].map(SENTIMENTO_LABEL),
+        "tema_ia": df["tema"].map(TEMA_LABEL),
+        "confianca_ia": df["confianca"],
+        "justificativa_ia": df["justificativa"],
+        "status_ia": df["status_analise"].map(STATUS_IA_LABEL),
+    })
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def carregar_nps(token: str, id_pesquisa: str, inicio: date, fim: date) -> dict:
+    return ClienteApi(token=token).nps(id_pesquisa, inicio, fim)
+
+
+def janela(dias: int, anterior: bool = False) -> tuple[date, date]:
+    """Período escolhido (ou o imediatamente anterior), em dias corridos até hoje."""
+    fim = date.today() - timedelta(days=dias if anterior else 0)
+    return fim - timedelta(days=dias - 1), fim
+
+
+def no_periodo(df: pd.DataFrame, inicio: date, fim: date) -> pd.DataFrame:
+    dia = df["data"].dt.date
+    return df[(dia >= inicio) & (dia <= fim)]
+
+
+# ---------------------------------------------------------------- cálculos de exibição
 def contagem_faixas(df: pd.DataFrame) -> tuple[int, int, int]:
     cont = df["faixa"].value_counts()
     return tuple(int(cont.get(f, 0)) for f in ("Promotor", "Neutro", "Detrator"))
-
-
-def metricas_exibicao(resp: pd.DataFrame, exib: pd.DataFrame) -> dict:
-    exibidas = len(resp) + len(exib)
-    return {
-        "exibidas": exibidas,
-        "respostas": len(resp),
-        "taxa": len(resp) / exibidas if exibidas else 0.0,
-        "dispensadas": int((exib["resultado"] == "dispensou").sum()),
-        "qualitativas": int((resp["comentario"].str.strip() != "").sum()),
-    }
 
 
 def historico(df: pd.DataFrame, dias: int) -> pd.DataFrame:
@@ -307,7 +230,7 @@ def historico(df: pd.DataFrame, dias: int) -> pd.DataFrame:
          .groupby("periodo")["faixa"].value_counts().unstack(fill_value=0)
          .reindex(columns=["Promotor", "Neutro", "Detrator"], fill_value=0))
     g["total"] = g.sum(axis=1)
-    g["score"] = [calc_nps(p, n, d) for p, n, d in zip(g["Promotor"], g["Neutro"], g["Detrator"])]
+    g["score"] = [nps_inteiro(p, n, d) for p, n, d in zip(g["Promotor"], g["Neutro"], g["Detrator"])]
     g = g.reset_index()
     g["period"] = g["periodo"].dt.strftime("%d/%m")
     return g
@@ -325,7 +248,7 @@ def resumo_tags(df: pd.DataFrame, coluna: str, nomes: list[str]) -> pd.DataFrame
             "respostas": n,
             "pro": p / n * 100 if n else 0, "pas": ne / n * 100 if n else 0,
             "det": d / n * 100 if n else 0,
-            "score": calc_nps(p, ne, d) if n else None,
+            "score": nps_inteiro(p, ne, d),
             "sentimento": g["sentimento_ia"].mode().iloc[0] if n else "—",
         })
     return pd.DataFrame(linhas).sort_values("respostas", ascending=False)
@@ -336,8 +259,8 @@ def ranquear(df: pd.DataFrame, melhores: bool, n: int = 5) -> pd.DataFrame:
     Melhores/piores respostas com comentário.
 
     Ordena pela nota. No empate, usa o sentimento sugerido pela IA ponderado
-    pela confiança (só análises concluídas, confiança >= 0,6) e, por fim, a
-    resposta mais recente. A IA só desempata: nunca muda a nota.
+    pela confiança (só análises concluídas) e, por fim, a resposta mais
+    recente. A IA só desempata: nunca muda a nota.
     """
     com_texto = df[df["comentario"].str.strip() != ""].copy()
     sinal = com_texto["sentimento_ia"].map({"Positivo": 1, "Neutro": 0, "Negativo": -1})
@@ -348,18 +271,21 @@ def ranquear(df: pd.DataFrame, melhores: bool, n: int = 5) -> pd.DataFrame:
     ).head(n)
 
 
-def render_filters(key: str) -> tuple[str, str, str]:
-    """Filtros de segmento, empresa e período (3 colunas; empilham no mobile)."""
-    f1, f2, f3 = st.columns(3)
-    seg = f1.selectbox("Segmento", ["Todos os segmentos", "Empresarial", "PME", "Gratuito"],
-                       key=f"{key}_seg")
-    emp = f2.selectbox("Empresa", ["Todas as empresas", "Empresa A", "Empresa B"],
-                       key=f"{key}_emp")
-    per = f3.selectbox("Período", ["Últimos 7 dias", "Últimos 30 dias", "Últimos 90 dias"],
-                       key=f"{key}_per")
-    return seg, emp, per
+def fmt_int(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
 
 
+def fmt_nps(v) -> str:
+    return "—" if v is None or pd.isna(v) else f"{int(v)}"
+
+
+def variacao_pct(atual, anterior) -> float | None:
+    if atual is None or anterior in (None, 0):
+        return None
+    return (atual - anterior) / abs(anterior) * 100
+
+
+# ---------------------------------------------------------------- componentes
 def kpi_grid(itens: list[tuple[str, str]]) -> None:
     """Cards de indicador sem variação (título, valor)."""
     cards = "".join(
@@ -368,10 +294,6 @@ def kpi_grid(itens: list[tuple[str, str]]) -> None:
         for t, v in itens
     )
     st.markdown(f'<div class="kpi-grid">{cards}</div>', unsafe_allow_html=True)
-
-
-def fmt_int(n: int) -> str:
-    return f"{n:,}".replace(",", ".")
 
 
 def kpi_grid_delta(itens: list[tuple[str, str, float | None, bool]]) -> None:
@@ -392,90 +314,93 @@ def kpi_grid_delta(itens: list[tuple[str, str, float | None, bool]]) -> None:
     st.markdown(f'<div class="kpi-grid">{cards}</div>', unsafe_allow_html=True)
 
 
-def botao_analise(df: pd.DataFrame, key: str) -> None:
-    """Botão que manda para a IA os comentários de df ainda sem análise válida."""
-    com_texto = df[df["comentario"].str.strip() != ""]
-    pendentes = com_texto[~com_texto["status_ia"].isin(["Concluída", "Baixa confiança"])]
-    if not ia_configurada():
-        st.button("Gerar análise", disabled=True, width="stretch", key=key)
-        st.warning("Chave do Gemini não encontrada. Defina GEMINI_API_KEY no .env.")
-        return
-    if st.button(f"Gerar análise ({len(pendentes)})", type="primary",
-                 disabled=pendentes.empty, width="stretch", key=key):
-        with st.spinner("Analisando comentários com o Gemini..."):
-            novas = analisar_comentarios(dict(zip(pendentes["id"], pendentes["comentario"])))
-        st.session_state["analises_ia"].update(novas)
-        st.rerun()
-
-
 def card_resposta(r) -> str:
     """Card de uma resposta. Comentário vem do cliente: sempre escapado."""
     cor = FAIXA_COLOR[r.faixa]
-    if r.status_ia in ("Concluída", "Baixa confiança"):
-        # sem reclamação vem NaN do pandas (que é "verdadeiro"): checar com notna
-        problema = f" · problema: {escape(r.problema_ia)}" if pd.notna(r.problema_ia) else ""
-        ia = (f"{escape(r.sentimento_ia)} · {escape(r.tema_ia)}{problema} · "
-              f"{r.confianca_ia:.0%} de confiança")
+    if r.status_ia in ("Concluída", "Baixa confiança") and pd.notna(r.sentimento_ia):
+        ia = f"{escape(r.sentimento_ia)} · {escape(r.tema_ia)} · {r.confianca_ia:.0%} de confiança"
         if r.status_ia == "Baixa confiança":
             ia += " (baixa, fora das contagens)"
-        if r.justificativa_ia:
+        if isinstance(r.justificativa_ia, str) and r.justificativa_ia:
             ia += f'<br><i>{escape(r.justificativa_ia)}</i>'
     else:
-        ia = escape(str(r.status_ia or "pendente")).lower()
+        ia = escape(str(r.status_ia if pd.notna(r.status_ia) else "aguardando o worker de IA")).lower()
     return (
         '<div class="resp-card">'
         f'<div class="resp-top"><span class="nota" style="background:{cor}">{r.nota}</span>'
-        f'<span class="resp-meta">{r.faixa} · {r.data:%d/%m/%Y} · {escape(r.empresa)}</span></div>'
+        f'<span class="resp-meta">{r.faixa} · {r.data:%d/%m/%Y}</span></div>'
         f'<div class="resp-txt">“{escape(r.comentario)}”</div>'
         f'<div class="resp-ia">🤖 Análise sugerida: {ia}</div>'
         "</div>"
     )
 
 
-# ---------------------------------------------------------------- análises da IA (sessão)
-analises = st.session_state.setdefault("analises_ia", {})
-# prompt mudou → análises antigas saem e a resposta volta a ficar pendente
-for id_resp in [k for k, a in analises.items() if a.get("versao_prompt") != PROMPT_VERSAO]:
-    del analises[id_resp]
-base = aplicar_analises(load_respostas(), analises)
+AVISO_IA = (
+    "🤖 *Sugerido* = análise sugerida pela IA, feita automaticamente pelo worker depois de "
+    "cada resposta (dados pessoais mascarados antes do envio). Confiança abaixo de 60% fica "
+    "como baixa confiança e fora das contagens. A IA nunca altera a nota nem o NPS."
+)
 
-# ---------------------------------------------------------------- cabeçalho
-col_title, col_btn = st.columns([5, 1], vertical_alignment="center")
+
+# ================================================================= página
+if "token" not in st.session_state:
+    tela_login()
+    st.stop()
+
+usuario = st.session_state["usuario"]
+pesquisas = chamar(carregar_pesquisas, st.session_state["token"])
+
+col_title, col_user = st.columns([5, 1], vertical_alignment="center")
 col_title.title("NPS")
-col_btn.button("Editar NPS", type="primary", width="stretch")
+with col_user:
+    st.caption(f"{escape(usuario['nome'])} · {usuario['papel']}")
+    if st.button("Sair", width="stretch"):
+        sair()
+        st.rerun()
+
+if not pesquisas:
+    st.info("Nenhuma pesquisa cadastrada ainda. Um ADMIN cria e publica pesquisas no painel web.")
+    st.stop()
+
+# Filtros (valem para as três abas)
+f1, f2 = st.columns([3, 1])
+rotulos = {p["id"]: f'{p["titulo"]} · v{p["numero_versao"]} · {p["status"].lower()}' for p in pesquisas}
+id_pesquisa = f1.selectbox("Pesquisa", list(rotulos), format_func=rotulos.get, key="pesquisa")
+periodo = f2.selectbox("Período", list(DIAS_PERIODO), index=1, key="periodo")
+dias = DIAS_PERIODO[periodo]
+ini_at, fim_at = janela(dias)
+ini_ant, fim_ant = janela(dias, anterior=True)
+
+token = st.session_state["token"]
+base = chamar(carregar_respostas, token, id_pesquisa, ini_ant, fim_at)
+atual = no_periodo(base, ini_at, fim_at)
+anterior = no_periodo(base, ini_ant, fim_ant)
+nps_at = chamar(carregar_nps, token, id_pesquisa, ini_at, fim_at)
+nps_ant = chamar(carregar_nps, token, id_pesquisa, ini_ant, fim_ant)
 
 tab_overview, tab_responses, tab_tags = st.tabs(["Visão geral", "Respostas", "Tags"])
 
 with tab_overview:
-    filtros_ov = render_filters("ov")
-    dias = DIAS_PERIODO[filtros_ov[2]]
-    atual = aplicar_filtros(base, *filtros_ov)
-    m_at = metricas_exibicao(atual, aplicar_filtros(load_exibicoes(), *filtros_ov))
-    m_ant = metricas_exibicao(aplicar_filtros(base, *filtros_ov, anterior=True),
-                              aplicar_filtros(load_exibicoes(), *filtros_ov, anterior=True))
-
-    def variacao(chave: str) -> float | None:
-        a, b = m_at[chave], m_ant[chave]
-        return (a - b) / b * 100 if b else None
-
-    # ------------------------------------------------------------ KPIs
+    qualitativas = lambda df: int((df["comentario"].str.strip() != "").sum())
+    analisadas = lambda df: int((df["status_ia"] == "Concluída").sum())
     kpi_grid_delta([
-        ("👁 Total exibido", fmt_int(m_at["exibidas"]), variacao("exibidas"), False),
-        ("💬 Total de respostas", fmt_int(m_at["respostas"]), variacao("respostas"), False),
-        ("📈 Taxa de resposta", f"{m_at['taxa']:.1%}".replace(".", ","), variacao("taxa"), False),
-        ("⊗ Dispensadas", fmt_int(m_at["dispensadas"]), variacao("dispensadas"), True),
-        ("✅ Respostas qualitativas", fmt_int(m_at["qualitativas"]),
-         variacao("qualitativas"), False),
+        ("📊 NPS", fmt_nps(nps_at["valor_nps"]),
+         variacao_pct(nps_at["valor_nps"], nps_ant["valor_nps"]), False),
+        ("💬 Total de respostas", fmt_int(nps_at["total_respostas"]),
+         variacao_pct(nps_at["total_respostas"], nps_ant["total_respostas"]), False),
+        ("✅ Respostas qualitativas", fmt_int(qualitativas(atual)),
+         variacao_pct(qualitativas(atual), qualitativas(anterior)), False),
+        ("🤖 Analisadas pela IA", fmt_int(analisadas(atual)),
+         variacao_pct(analisadas(atual), analisadas(anterior)), False),
     ])
-    st.caption(f"Variação comparada aos {dias} dias anteriores.")
+    st.caption(f"Variação comparada aos {dias} dias anteriores. NPS calculado pela API.")
 
-    if atual.empty:
-        st.info("Nenhuma resposta para os filtros escolhidos.")
+    if nps_at["status"] == "sem_dados_suficientes":
+        st.info("Ainda não há respostas neste período: o NPS não existe (não é zero).")
     else:
-        # -------------------------------------------------------- Pontuação + Respostas
-        promoters, passives, detractors = contagem_faixas(atual)
-        score = calc_nps(promoters, passives, detractors)
-        total = promoters + passives + detractors
+        promoters, passives, detractors = (nps_at["qtd_promotores"], nps_at["qtd_neutros"],
+                                           nps_at["qtd_detratores"])
+        total = nps_at["total_respostas"]
 
         c1, c2 = st.columns(2)
 
@@ -484,7 +409,7 @@ with tab_overview:
             gauge = go.Figure(
                 go.Indicator(
                     mode="gauge+number",
-                    value=score,
+                    value=nps_at["valor_nps"],
                     number={"font": {"color": BLUE, "size": 44}},
                     gauge={
                         "axis": {"range": [-100, 100], "tickvals": [-100, 0, 100]},
@@ -536,7 +461,6 @@ with tab_overview:
             pct = lambda col: df[col] / df["total"] * 100
 
             fig = make_subplots(specs=[[{"secondary_y": True}]])
-            # barras empilhadas (% de respostas) -> eixo secundário
             fig.add_bar(x=df["period"], y=pct("Detrator"), name="Detratores",
                         marker_color=RED, secondary_y=True)
             fig.add_bar(x=df["period"], y=pct("Neutro"), name="Neutros",
@@ -564,40 +488,20 @@ with tab_overview:
             st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
 
 with tab_responses:
-    resp = aplicar_filtros(base, *render_filters("rs"))
+    resp = atual
 
     if resp.empty:
-        st.info("Nenhuma resposta para os filtros escolhidos.")
+        st.info("Nenhuma resposta neste período.")
     else:
-        # -------------------------------------------------------- Análise sugerida (IA)
-        with st.container(border=True):
-            a1, a2 = st.columns([3, 1], vertical_alignment="center")
-            a1.subheader("🤖 Análise sugerida pela IA")
-            a1.caption(
-                f"Gemini `{MODELO}` · prompt `{PROMPT_VERSAO}`. Antes do envio, CPF, e-mail e "
-                "telefone são mascarados; se não der para mascarar com segurança, o comentário "
-                f"não é enviado. Até {LIMITE_POR_EXECUCAO} comentários distintos por vez. "
-                "A IA só sugere: nunca altera a nota nem o NPS."
-            )
-            with a2:
-                botao_analise(resp, "btn_ia")
-
-            falhas = [a["erro"] for a in analises.values() if a["status"] == "PENDENTE" and a["erro"]]
-            if falhas:
-                st.warning(f"{len(falhas)} comentário(s) ficaram pendentes: {falhas[0]}")
-
-
         # -------------------------------------------------------- Resumo
-        cont = resp["faixa"].value_counts()
         com_texto = (resp["comentario"].str.strip() != "").mean()
-        nps = calc_nps(cont.get("Promotor", 0), cont.get("Neutro", 0), cont.get("Detrator", 0))
         kpi_grid([
-            ("📊 NPS do período", f"{nps:.1f}".replace(".", ",")),
-            ("💬 Respostas", f"{len(resp)}"),
+            ("📊 NPS do período", fmt_nps(nps_at["valor_nps"])),
+            ("💬 Respostas", fmt_int(len(resp))),
             ("⭐ Nota média", f"{resp['nota'].mean():.1f}".replace(".", ",")),
             ("✍️ Com comentário", f"{com_texto:.0%}"),
             # baixa confiança fica fora das contagens
-            ("🤖 Analisadas pela IA", f"{(resp['status_ia'] == 'Concluída').sum()}"),
+            ("🤖 Analisadas pela IA", fmt_int(int((resp["status_ia"] == "Concluída").sum()))),
         ])
 
         # -------------------------------------------------------- Distribuição
@@ -606,7 +510,7 @@ with tab_responses:
             dist = resp["nota"].value_counts().reindex(range(11), fill_value=0)
             barras = go.Figure(go.Bar(
                 x=list(dist.index), y=list(dist.values),
-                marker_color=[FAIXA_COLOR[faixa_nps(n)] for n in dist.index],
+                marker_color=[GREEN if n >= 9 else MUTED if n >= 7 else RED for n in dist.index],
                 hovertemplate="Nota %{x}: %{y} respostas<extra></extra>",
             ))
             barras.update_layout(**PLOT_LAYOUT, height=280, bargap=0.25,
@@ -626,35 +530,31 @@ with tab_responses:
             st.markdown("".join(card_resposta(r) for r in ranquear(resp, False).itertuples()),
                         unsafe_allow_html=True)
 
-        # -------------------------------------------------------- Problemas por classe
+        # -------------------------------------------------------- Reclamações por tema
         with st.container(border=True):
-            st.subheader("🚨 Problemas por classe (análise sugerida)")
-            # só análises concluídas (baixa confiança fica fora das contagens)
-            problemas = resp[(resp["status_ia"] == "Concluída") & resp["problema_ia"].notna()]
-            if problemas.empty:
-                st.info("Gere a análise sugerida acima para classificar as reclamações em "
-                        "Valor, Sistema, Demora, Cobrança indevida e Outros.")
+            st.subheader("🚨 Reclamações por tema (análise sugerida)")
+            st.caption("Detratores e neutros com análise concluída, agrupados pelo tema sugerido.")
+            reclamacoes = resp[(resp["status_ia"] == "Concluída") & (resp["faixa"] != "Promotor")
+                               & resp["tema_ia"].notna()]
+            if reclamacoes.empty:
+                st.info("Ainda não há reclamações analisadas pelo worker de IA neste período.")
             else:
-                classes = list(PROBLEMA_LABEL.values())
                 resumo = (
-                    problemas.groupby("problema_ia")
+                    reclamacoes.groupby("tema_ia")
                     .agg(reclamacoes=("id", "size"),
                          detratores=("faixa", lambda f: (f == "Detrator").sum()),
                          nota_media=("nota", "mean"))
-                    .reindex(classes, fill_value=0)
-                    .reset_index(names="classe")
+                    .reindex(list(TEMA_LABEL.values()), fill_value=0)
+                    .reset_index(names="tema")
                 )
-                # classe sem reclamação não tem nota média (não é 0)
                 resumo["nota_media"] = resumo["nota_media"].where(resumo["reclamacoes"] > 0)
                 resumo["pct"] = resumo["reclamacoes"] / resumo["reclamacoes"].sum()
                 resumo = resumo.sort_values("reclamacoes", ascending=False)
 
                 st.dataframe(
-                    resumo,
-                    hide_index=True,
-                    width="stretch",
+                    resumo, hide_index=True, width="stretch",
                     column_config={
-                        "classe": "Classe",
+                        "tema": "Tema",
                         "reclamacoes": st.column_config.NumberColumn("Reclamações", format="%d"),
                         "detratores": st.column_config.NumberColumn("Detratores", format="%d"),
                         "nota_media": st.column_config.NumberColumn("Nota média", format="%.1f"),
@@ -662,24 +562,19 @@ with tab_responses:
                             "% das reclamações", min_value=0, max_value=1, format="percent"),
                     },
                 )
-
-                # respostas de cada classe, piores primeiro
-                for classe in resumo.loc[resumo["reclamacoes"] > 0, "classe"]:
-                    grupo = problemas[problemas["problema_ia"] == classe].sort_values(
+                for tema in resumo.loc[resumo["reclamacoes"] > 0, "tema"]:
+                    grupo = reclamacoes[reclamacoes["tema_ia"] == tema].sort_values(
                         ["nota", "data"], ascending=[True, False])
-                    with st.expander(f"{classe} · {len(grupo)} resposta(s)"):
+                    with st.expander(f"{tema} · {len(grupo)} resposta(s)"):
                         st.dataframe(
-                            grupo,
-                            hide_index=True,
-                            width="stretch",
+                            grupo, hide_index=True, width="stretch",
                             column_order=["data", "nota", "faixa", "comentario",
                                           "justificativa_ia", "confianca_ia"],
                             column_config={
                                 "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
                                 "nota": st.column_config.NumberColumn("Nota", format="%d"),
                                 "faixa": "Faixa",
-                                "comentario": st.column_config.TextColumn("Comentário",
-                                                                          width="large"),
+                                "comentario": st.column_config.TextColumn("Comentário", width="large"),
                                 "justificativa_ia": st.column_config.TextColumn(
                                     "Justificativa (sugerida)", width="large"),
                                 "confianca_ia": st.column_config.ProgressColumn(
@@ -699,8 +594,9 @@ with tab_responses:
             tabela = tabela.sort_values("data", ascending=False)
 
             # Comentários vêm do cliente: o CSV aberto no Excel não pode
-            # executar fórmula (=, +, -, @ no início viram texto)
-            exp = tabela[["data", "nota", "faixa", "comentario", "empresa", "segmento"]].copy()
+            # executar fórmula (=, +, -, @ no início viram texto). Os
+            # comentários já chegam anonimizados da API.
+            exp = tabela[["data", "nota", "faixa", "comentario", "sentimento_ia", "tema_ia"]].copy()
             exp["comentario"] = exp["comentario"].where(
                 ~exp["comentario"].str.match(r"^[=+\-@]"), "'" + exp["comentario"]
             )
@@ -711,21 +607,16 @@ with tab_responses:
             )
 
             st.dataframe(
-                tabela,
-                hide_index=True,
-                width="stretch",
-                column_order=["data", "nota", "faixa", "comentario", "empresa",
-                              "sentimento_ia", "tema_ia", "problema_ia", "confianca_ia",
-                              "status_ia", "justificativa_ia"],
+                tabela, hide_index=True, width="stretch",
+                column_order=["data", "nota", "faixa", "comentario", "sentimento_ia", "tema_ia",
+                              "confianca_ia", "status_ia", "justificativa_ia"],
                 column_config={
                     "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
                     "nota": st.column_config.NumberColumn("Nota", format="%d"),
                     "faixa": "Faixa",
                     "comentario": st.column_config.TextColumn("Comentário", width="large"),
-                    "empresa": "Empresa",
                     "sentimento_ia": "Sentimento (sugerido)",
                     "tema_ia": "Tema (sugerido)",
-                    "problema_ia": "Problema (sugerido)",
                     "confianca_ia": st.column_config.ProgressColumn(
                         "Confiança", min_value=0, max_value=1, format="percent"),
                     "status_ia": "Status da análise",
@@ -733,30 +624,21 @@ with tab_responses:
                                                                     width="large"),
                 },
             )
-            st.caption(
-                "🤖 Colunas *sugerido*: análise sugerida pela IA. Confiança abaixo de 60% "
-                "fica como baixa confiança e fora das contagens. A IA nunca altera a nota nem o NPS."
-            )
+            st.caption(AVISO_IA)
 
 with tab_tags:
-    dados = aplicar_filtros(base, *render_filters("tg"))
+    dados = atual
 
     with st.container(border=True):
-        h1, h2, h3, h4 = st.columns([1, 2, 3, 1], vertical_alignment="center")
+        h1, h3, h4 = st.columns([1, 4, 1], vertical_alignment="center")
         h1.subheader("Tags")
-        agrupar = h2.segmented_control(
-            "Agrupar por", ["Tema", "Problema"], default="Tema", key="tg_grupo",
-            label_visibility="collapsed",
-        ) or "Tema"
         busca = h3.text_input("Buscar tags", placeholder="🔍 Buscar tags...",
                               label_visibility="collapsed")
 
-        # tags fixas: as listas fechadas da IA. Ela só identifica a qual tag cada
-        # comentário pertence; baixa confiança fica fora das contagens
-        coluna, nomes = (("tema_ia", list(TEMA_LABEL.values())) if agrupar == "Tema"
-                         else ("problema_ia", list(PROBLEMA_LABEL.values())))
-        analisadas = dados[dados["status_ia"] == "Concluída"]
-        tags = resumo_tags(analisadas, coluna, nomes)
+        # tags fixas: a lista fechada de temas da IA. Ela só sugere a qual tag
+        # cada comentário pertence; baixa confiança fica fora das contagens
+        analisadas_tg = dados[dados["status_ia"] == "Concluída"]
+        tags = resumo_tags(analisadas_tg, "tema_ia", list(TEMA_LABEL.values()))
         if busca:
             tags = tags[tags["nome"].str.contains(busca, case=False, regex=False)]
 
@@ -765,18 +647,14 @@ with tab_tags:
             columns={"nome": "Nome", "respostas": "Respostas",
                      "score": "Pontuação", "sentimento": "Sentimento"}
         ).to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-        h4.download_button("⬇ Exportar", csv, "tags_nps.csv", "text/csv",
-                           width="stretch")
+        h4.download_button("⬇ Exportar", csv, "tags_nps.csv", "text/csv", width="stretch")
 
         n_texto = int((dados["comentario"].str.strip() != "").sum())
-        b1, b2 = st.columns([3, 1], vertical_alignment="center")
-        falta = "" if len(analisadas) >= n_texto else " Gere a análise para incluir os que faltam."
-        b1.caption(
-            f"🤖 Tags identificadas pela análise sugerida: {len(analisadas)} de {n_texto} "
-            f"comentários do período classificados.{falta}"
+        st.caption(
+            f"🤖 Tags pela análise sugerida: {len(analisadas_tg)} de {n_texto} comentários do "
+            "período classificados pelo worker de IA. A pontuação por tag segue a mesma regra "
+            "do NPS da API, aplicada só às respostas daquele tema."
         )
-        with b2:
-            botao_analise(dados, "btn_ia_tg")
 
         if tags.empty:
             st.info("Nenhuma tag encontrada.")
@@ -784,12 +662,11 @@ with tab_tags:
             rows = ""
             for t in tags.itertuples():
                 cor = SENT_COLOR.get(t.sentimento, MUTED)
-                score = "—" if pd.isna(t.score) else f"{t.score:.0f}"
                 rows += (
                     '<div class="tags-row">'
                     f'<div class="c-name">{escape(t.nome)}</div>'
                     f'<div class="c-resp"><span class="lbl">Respostas</span>{t.respostas}</div>'
-                    f'<div class="c-score"><span class="lbl">Pontuação</span>{score}</div>'
+                    f'<div class="c-score"><span class="lbl">Pontuação</span>{fmt_nps(t.score)}</div>'
                     '<div class="c-bar"><div class="bar">'
                     f'<span style="width:{t.pro:.1f}%;background:{GREEN}"></span>'
                     f'<span style="width:{t.pas:.1f}%;background:{GRAY}"></span>'
