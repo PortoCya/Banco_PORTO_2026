@@ -1,36 +1,38 @@
 """
-Tratamento centralizado de erros da aplicação (NPS KeyCore v1.0).
-Cobre: dados inválidos, autenticação/RBAC, rate limit, banco indisponível,
-API externa, timeout, resposta inesperada e erros da IA, sem vazar stack traces ou PII.
+Tratamento centralizado de erros.
+
+Toda resposta de erro tem o mesmo formato e carrega o id da requisição:
+    {"error": {"code": "...", "message": "...", "correlation_id": "..."}}
+
+Nada de stack trace, SQL ou dado de entrada na resposta ou no log.
 """
 import logging
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import OperationalError, IntegrityError, TimeoutError as SATimeout
-import httpx
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.logs import caminho_para_log, request_id_atual
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Exceções customizadas ────────────────────────────────────────────────────
+# ─── Exceções da aplicação ───────────────────────────────────────────────────
 
 class AppError(Exception):
     """Base para todos os erros da aplicação."""
     status_code: int = 500
     error_code: str = "INTERNAL_ERROR"
 
-    def __init__(self, detail: str, **extra: Any):
+    def __init__(self, detail: str, *, retry_after: Optional[int] = None, **extra: Any):
         self.detail = detail
+        self.retry_after = retry_after
         self.extra = extra
         super().__init__(detail)
-
-
-class BusinessRuleError(AppError):
-    status_code = 400
-    error_code = "BUSINESS_RULE_VIOLATION"
 
 
 class UnauthorizedError(AppError):
@@ -53,75 +55,54 @@ class ConflictError(AppError):
     error_code = "CONFLICT"
 
 
-class ValidationError(AppError):
+class InvalidInputError(AppError):
+    """Entrada inválida que o Pydantic não tem como pegar (ex.: período invertido)."""
     status_code = 422
     error_code = "VALIDATION_ERROR"
 
 
-class RateLimitExceededError(AppError):
+class TooManyRequestsError(AppError):
     status_code = 429
-    error_code = "RATE_LIMIT_EXCEEDED"
+    error_code = "TOO_MANY_REQUESTS"
 
 
-class DatabaseUnavailableError(AppError):
+class ServiceUnavailableError(AppError):
     status_code = 503
-    error_code = "DATABASE_UNAVAILABLE"
+    error_code = "SERVICE_UNAVAILABLE"
 
 
-class ExternalAPIError(AppError):
-    status_code = 502
-    error_code = "EXTERNAL_API_ERROR"
+# ─── Formato único de resposta ───────────────────────────────────────────────
 
-
-class TimeoutError(AppError):
-    status_code = 504
-    error_code = "TIMEOUT"
-
-
-class UnexpectedResponseError(AppError):
-    status_code = 502
-    error_code = "UNEXPECTED_RESPONSE"
-
-
-class AIError(AppError):
-    status_code = 502
-    error_code = "AI_ERROR"
-
-
-class AIQuotaExceededError(AIError):
-    error_code = "AI_QUOTA_EXCEEDED"
-
-
-class AIContentFilterError(AIError):
-    status_code = 422
-    error_code = "AI_CONTENT_FILTER"
-
-
-# ─── Formatador seguro de resposta de erro ───────────────────────────────────
-
-def _error_response(status_code: int, error_code: str, detail: str, request: Request = None, **extra) -> JSONResponse:
-    correlation_id = getattr(request.state, "correlation_id", None) if request else None
-    body: dict[str, Any] = {
-        "error": {
-            "code": error_code,
-            "message": detail,
-        }
+def resposta_erro(
+    status_code: int,
+    error_code: str,
+    detail: str,
+    *,
+    retry_after: Optional[int] = None,
+    **extra: Any,
+) -> JSONResponse:
+    request_id = request_id_atual()
+    corpo: dict[str, Any] = {
+        "error": {"code": error_code, "message": detail, "correlation_id": request_id}
     }
-    if correlation_id:
-        body["error"]["correlation_id"] = correlation_id
     if extra:
-        body["error"]["details"] = extra
-    return JSONResponse(status_code=status_code, content=body)
+        corpo["error"]["details"] = extra
+    headers = {"X-Request-ID": request_id, "X-Correlation-ID": request_id}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    if status_code == 401:
+        headers["WWW-Authenticate"] = "Bearer"
+    return JSONResponse(status_code=status_code, content=corpo, headers=headers)
 
 
-# ─── Registro de handlers no FastAPI ─────────────────────────────────────────
+# ─── Handlers ────────────────────────────────────────────────────────────────
 
 def register_exception_handlers(app: FastAPI) -> None:
 
-    # 1. Dados inválidos (Pydantic / FastAPI) — sanitizado para não vazar objetos internos
     @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        safe_fields = [
+    async def _validacao(request: Request, exc: RequestValidationError):
+        # Só loc/msg/type: o "input" (que pode ser uma senha) nunca sai daqui
+        campos = [
             {
                 "loc": [str(x) for x in err.get("loc", [])],
                 "msg": err.get("msg", "Valor inválido"),
@@ -129,83 +110,49 @@ def register_exception_handlers(app: FastAPI) -> None:
             }
             for err in exc.errors()
         ]
-        logger.warning("Dados inválidos na requisição %s: %s", request.url.path, safe_fields)
-        return _error_response(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "VALIDATION_ERROR",
-            "Dados de entrada inválidos ou campos não permitidos.",
-            request=request,
-            fields=safe_fields,
-        )
+        logger.info("Entrada inválida em %s: %s", caminho_para_log(request.url.path),
+                    [(c["loc"], c["type"]) for c in campos])
+        return resposta_erro(422, "VALIDATION_ERROR", "Dados de entrada inválidos.", fields=campos)
 
-    # 2. Erros customizados da aplicação
     @app.exception_handler(AppError)
-    async def app_error_handler(request: Request, exc: AppError):
-        logger.warning("[%s] %s (rota=%s)", exc.error_code, exc.detail, request.url.path)
-        return _error_response(exc.status_code, exc.error_code, exc.detail, request=request, **exc.extra)
+    async def _app_error(request: Request, exc: AppError):
+        logger.info("[%s] %s (rota=%s)", exc.error_code, exc.detail, caminho_para_log(request.url.path))
+        return resposta_erro(exc.status_code, exc.error_code, exc.detail,
+                             retry_after=exc.retry_after, **exc.extra)
 
-    # 3. Banco indisponível (SQLAlchemy OperationalError) — nunca vaza SQL bruto
-    @app.exception_handler(OperationalError)
-    async def db_operational_handler(request: Request, exc: OperationalError):
-        logger.critical("Banco de dados indisponível na rota %s", request.url.path, exc_info=True)
-        return _error_response(
-            503,
-            "DATABASE_UNAVAILABLE",
-            "Banco de dados temporariamente indisponível.",
-            request=request,
-        )
+    @app.exception_handler(StarletteHTTPException)
+    async def _http(request: Request, exc: StarletteHTTPException):
+        codigos = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}
+        return resposta_erro(exc.status_code, codigos.get(exc.status_code, "HTTP_ERROR"), str(exc.detail))
 
-    # 4. Violação de integridade (FK, UNIQUE, CHECK) — nunca vaza estrutura interna da tabela
+    # Pool esgotado = servidor saturado. Pede para o cliente voltar depois em
+    # vez de estourar um 500 ou deixar a fila crescer.
+    @app.exception_handler(PoolTimeoutError)
+    async def _saturado(request: Request, exc: PoolTimeoutError):
+        logger.error("Pool de conexões esgotado (rota=%s)", caminho_para_log(request.url.path))
+        return resposta_erro(429, "SERVER_BUSY", "Servidor ocupado. Tente novamente em instantes.",
+                             retry_after=5)
+
     @app.exception_handler(IntegrityError)
-    async def db_integrity_handler(request: Request, exc: IntegrityError):
-        logger.error("Violação de integridade no banco na rota %s", request.url.path)
-        return _error_response(
-            409,
-            "CONFLICT",
-            "Conflito de integridade: registro duplicado, referência inválida ou violação de regra do banco.",
-            request=request,
-        )
+    async def _integridade(request: Request, exc: IntegrityError):
+        logger.warning("Violação de integridade (rota=%s, tipo=%s)",
+                       caminho_para_log(request.url.path), type(exc.orig).__name__)
+        return resposta_erro(409, "CONFLICT", "Conflito com um registro existente.")
 
-    # 5. Timeout de banco
-    @app.exception_handler(SATimeout)
-    async def db_timeout_handler(request: Request, exc: SATimeout):
-        logger.error("Timeout no banco de dados na rota %s", request.url.path)
-        return _error_response(
-            504,
-            "DATABASE_TIMEOUT",
-            "A consulta ao banco excedeu o tempo limite.",
-            request=request,
-        )
+    # Banco fora do ar, comando cancelado por statement_timeout/lock_timeout...
+    @app.exception_handler(OperationalError)
+    async def _banco_indisponivel(request: Request, exc: OperationalError):
+        logger.error("Banco indisponível ou lento (rota=%s, tipo=%s)",
+                     caminho_para_log(request.url.path), type(exc.orig).__name__)
+        return resposta_erro(503, "DATABASE_UNAVAILABLE",
+                             "Banco de dados temporariamente indisponível.", retry_after=5)
 
-    # 6. API externa / IA — timeout de rede
-    @app.exception_handler(httpx.TimeoutException)
-    async def http_timeout_handler(request: Request, exc: httpx.TimeoutException):
-        logger.error("Timeout na API externa na rota %s", request.url.path)
-        return _error_response(
-            504,
-            "TIMEOUT",
-            "A requisição para a API externa excedeu o tempo limite.",
-            request=request,
-        )
+    @app.exception_handler(DBAPIError)
+    async def _banco(request: Request, exc: DBAPIError):
+        logger.error("Erro de banco (rota=%s, tipo=%s)", caminho_para_log(request.url.path), type(exc.orig).__name__)
+        return resposta_erro(500, "INTERNAL_ERROR", "Erro interno do servidor.")
 
-    # 7. Erro de conexão com API externa
-    @app.exception_handler(httpx.ConnectError)
-    async def http_connect_handler(request: Request, exc: httpx.ConnectError):
-        logger.error("API externa indisponível na rota %s", request.url.path)
-        return _error_response(
-            502,
-            "EXTERNAL_API_ERROR",
-            "API externa indisponível.",
-            request=request,
-        )
-
-    # 8. Erros não tratados → 500 (mensagem genérica segura sem stack trace)
     @app.exception_handler(Exception)
-    async def generic_handler(request: Request, exc: Exception):
-        logger.critical("Erro inesperado na rota %s: %s", request.url.path, type(exc).__name__, exc_info=True)
-        return _error_response(
-            500,
-            "INTERNAL_ERROR",
-            "Erro interno do servidor.",
-            request=request,
-        )
+    async def _generico(request: Request, exc: Exception):
+        logger.critical("Erro inesperado (rota=%s)", caminho_para_log(request.url.path), exc_info=True)
+        return resposta_erro(500, "INTERNAL_ERROR", "Erro interno do servidor.")
