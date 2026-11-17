@@ -1,0 +1,103 @@
+# Ambiente local completo: PostgreSQL + Redis + migrations + API + worker de IA.
+#
+#   cp .env.example .env      # preencha SECRET_KEY, POSTGRES_PASSWORD, WORKER_DB_PASSWORD, ADMIN_*, IA_API_KEY
+#   docker compose up --build
+#
+# Nenhum segredo fica neste arquivo: tudo vem do .env (fora do git).
+# API e worker são processos distintos e usam usuários de banco diferentes.
+
+x-app: &app
+  build: .
+  env_file: .env
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nps
+      POSTGRES_USER: nps_api
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+    volumes:
+      - dados_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nps_api -d nps"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - dados_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Roda as migrations e as permissões do worker, e termina.
+  migracoes:
+    <<: *app
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg://nps_api:${POSTGRES_PASSWORD}@db:5432/nps
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  permissoes-worker:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?defina WORKER_DB_PASSWORD no .env}
+    volumes:
+      - ./scripts/permissoes_worker.sql:/permissoes_worker.sql:ro
+    entrypoint: ["sh", "-c", "psql -h db -U nps_api -d nps -v senha=\"'$$WORKER_DB_PASSWORD'\" -f /permissoes_worker.sql"]
+    depends_on:
+      migracoes:
+        condition: service_completed_successfully
+
+  api:
+    <<: *app
+    environment:
+      DATABASE_URL: postgresql+psycopg://nps_api:${POSTGRES_PASSWORD}@db:5432/nps
+      REDIS_URL: redis://redis:6379/0
+    # --proxy-headers: atrás de um proxy reverso, o IP do cliente (rate limit)
+    # vem do X-Forwarded-For. Restrinja --forwarded-allow-ips ao IP do proxy.
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2",
+              "--proxy-headers", "--forwarded-allow-ips", "${PROXY_IPS:-127.0.0.1}"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      migracoes:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker-ia:
+    <<: *app
+    environment:
+      DATABASE_URL: postgresql+psycopg://nps_api:${POSTGRES_PASSWORD}@db:5432/nps
+      WORKER_DATABASE_URL: postgresql+psycopg://nps_worker:${WORKER_DB_PASSWORD}@db:5432/nps
+      REDIS_URL: redis://redis:6379/0
+    command: ["python", "-m", "app.ia.worker"]
+    depends_on:
+      permissoes-worker:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  dados_postgres:
+  dados_redis:

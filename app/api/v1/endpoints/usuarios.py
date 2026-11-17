@@ -1,195 +1,126 @@
 """
-Endpoints de Autenticação, Autorização (RBAC) e Gestão de Usuários — NPS KeyCore v1.0.
-Atende RF-001 (Auth segura no backend) e RF-002 (Gestão ADMIN / ANALYST) + Auditoria (RF-020).
+Endpoints — Usuários (somente ADMIN)
 """
+import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, status
-from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.api.deps import Paginacao, paginacao, requer_papel
 from app.core.database import get_db
-from app.core.errors import ConflictError, NotFoundError, UnauthorizedError
-from app.core.security import (
-    bearer_scheme,
-    criar_token_acesso,
-    gerar_senha_hash,
-    get_current_user,
-    rate_limit,
-    registrar_auditoria,
-    require_roles,
-    revogar_token,
-    verificar_senha,
-)
+from app.core.errors import ConflictError, NotFoundError
+from app.core.security import gerar_hash_senha
 from app.models.models import Usuario
-from app.schemas.schemas import (
-    LoginRequest,
-    TokenResponse,
-    UsuarioCreate,
-    UsuarioResponse,
-)
+from app.schemas.schemas import UsuarioCreate, UsuarioResponse, UsuarioUpdate
+from app.services.auditoria import estado_usuario, registrar_auditoria
 
-router = APIRouter()
+router = APIRouter(tags=["Usuários"])
 
 
-# ══════════════════════════════════════════════════════════════════
-# AUTENTICAÇÃO (/auth)
-# ══════════════════════════════════════════════════════════════════
-
-@router.post(
-    "/auth/login",
-    response_model=TokenResponse,
-    summary="Autenticar usuário (ADMIN ou ANALYST)",
-    tags=["Auth"],
-    dependencies=[Depends(rate_limit("auth_login", max_requests=10, window_seconds=60))],
-)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Valida credenciais com hash PBKDF2-HMAC-SHA256 e emite token JWT assinado.
-    Protegido por Rate Limiting (máx. 10 tentativas/min por IP).
-    """
-    usuario = db.query(Usuario).filter(Usuario.email == payload.email).first()
-    if not usuario or not usuario.ativo or not verificar_senha(payload.senha, usuario.senha_hash):
-        raise UnauthorizedError("E-mail ou senha inválidos.")
-
-    token = criar_token_acesso(usuario_id=usuario.id, papel=usuario.papel)
-    registrar_auditoria(
-        db=db,
-        id_usuario_ator=usuario.id,
-        acao="AUTH_LOGIN_SUCCESS",
-        tipo_entidade="USUARIO",
-        id_entidade=usuario.id,
-        estado_depois={"email": usuario.email, "papel": usuario.papel},
-    )
-    db.commit()
-
-    return TokenResponse(
-        access_token=token,
-        expires_in_minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
-        papel=usuario.papel,
-        usuario_id=usuario.id,
-    )
+def _buscar_usuario(db: Session, id_usuario: uuid.UUID) -> Usuario:
+    usuario = db.get(Usuario, id_usuario)
+    if not usuario:
+        raise NotFoundError("Usuário não encontrado.")
+    return usuario
 
 
-@router.post(
-    "/auth/logout",
-    status_code=status.HTTP_200_OK,
-    summary="Encerrar sessão e revogar token atual",
-    tags=["Auth"],
-)
-def logout(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    usuario_atual: Usuario = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    if credentials and credentials.credentials:
-        revogar_token(credentials.credentials)
-    registrar_auditoria(
-        db=db,
-        id_usuario_ator=usuario_atual.id,
-        acao="AUTH_LOGOUT",
-        tipo_entidade="USUARIO",
-        id_entidade=usuario_atual.id,
-    )
-    db.commit()
-    return {"status": "ok", "message": "Sessão encerrada e token revogado com sucesso."}
-
-
-@router.get(
-    "/auth/me",
-    response_model=UsuarioResponse,
-    summary="Obter perfil do usuário autenticado",
-    tags=["Auth"],
-)
-def me(usuario_atual: Usuario = Depends(get_current_user)):
-    return usuario_atual
-
-
-# ══════════════════════════════════════════════════════════════════
-# GESTÃO DE USUÁRIOS (RBAC: Exclusivo ADMIN)
-# ══════════════════════════════════════════════════════════════════
-
-@router.post(
-    "/usuarios",
-    response_model=UsuarioResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Criar novo usuário (Requer ADMIN)",
-    tags=["Usuários"],
-)
+@router.post("/usuarios", response_model=UsuarioResponse, status_code=status.HTTP_201_CREATED,
+             summary="Criar usuário")
 def criar_usuario(
     payload: UsuarioCreate,
     db: Session = Depends(get_db),
-    admin: Usuario = Depends(require_roles("ADMIN")),
+    admin: Usuario = Depends(requer_papel("ADMIN")),
 ):
-    existente = db.query(Usuario).filter(Usuario.email == payload.email).first()
-    if existente:
-        raise ConflictError(f"E-mail '{payload.email}' já está cadastrado.")
-
-    novo = Usuario(
+    """
+    **Recebe:** nome, email, senha (12 a 128 caracteres), papel (ADMIN|ANALYST)
+    **Códigos:** 201 | 401 | 403 | 409 (e-mail já cadastrado) | 422
+    """
+    usuario = Usuario(
         nome=payload.nome,
         email=payload.email,
-        senha_hash=gerar_senha_hash(payload.senha),
+        senha_hash=gerar_hash_senha(payload.senha),
         papel=payload.papel,
-        ativo=True,
     )
-    db.add(novo)
-    db.flush()
-
-    registrar_auditoria(
-        db=db,
-        id_usuario_ator=admin.id,
-        acao="CRIAR_USUARIO",
-        tipo_entidade="USUARIO",
-        id_entidade=novo.id,
-        estado_depois={"nome": novo.nome, "email": novo.email, "papel": novo.papel, "ativo": novo.ativo},
-    )
+    db.add(usuario)
+    try:
+        # O UNIQUE do banco é quem decide: checar antes com SELECT deixaria
+        # passar duas criações simultâneas com o mesmo e-mail.
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise ConflictError("E-mail já cadastrado.", field="email")
+    registrar_auditoria(db, admin, "CRIAR_USUARIO", "USUARIO", usuario.id,
+                        estado_depois=estado_usuario(usuario))
     db.commit()
-    db.refresh(novo)
-    return novo
+    return usuario
 
 
-@router.get(
-    "/usuarios",
-    response_model=List[UsuarioResponse],
-    summary="Listar usuários (Requer ADMIN)",
-    tags=["Usuários"],
-)
-def listar_usuarios(
-    skip: int = 0,
-    limit: int = 50,
+@router.get("/usuarios", response_model=List[UsuarioResponse], summary="Listar usuários",
+            dependencies=[Depends(requer_papel("ADMIN"))])
+def listar_usuarios(pag: Paginacao = Depends(paginacao), db: Session = Depends(get_db)):
+    """**Códigos:** 200 | 401 | 403 | 422"""
+    return db.execute(
+        select(Usuario).order_by(Usuario.criado_em, Usuario.id).offset(pag.skip).limit(pag.limit)
+    ).scalars().all()
+
+
+@router.get("/usuarios/{id_usuario}", response_model=UsuarioResponse, summary="Buscar usuário",
+            dependencies=[Depends(requer_papel("ADMIN"))])
+def buscar_usuario(id_usuario: uuid.UUID, db: Session = Depends(get_db)):
+    """**Códigos:** 200 | 401 | 403 | 404 | 422"""
+    return _buscar_usuario(db, id_usuario)
+
+
+@router.patch("/usuarios/{id_usuario}", response_model=UsuarioResponse,
+              summary="Alterar nome, papel ou status do usuário")
+def atualizar_usuario(
+    id_usuario: uuid.UUID,
+    payload: UsuarioUpdate,
     db: Session = Depends(get_db),
-    admin: Usuario = Depends(require_roles("ADMIN")),
+    admin: Usuario = Depends(requer_papel("ADMIN")),
 ):
-    return db.query(Usuario).offset(skip).limit(min(limit, 100)).all()
+    """
+    **Recebe:** nome, papel e/ou ativo
+    **Códigos:** 200 | 401 | 403 | 404 | 409 (ADMIN rebaixando ou desativando a si mesmo) | 422
+    """
+    usuario = _buscar_usuario(db, id_usuario)
+    mudancas = payload.model_dump(exclude_unset=True)
 
+    # Evita que o ADMIN se tranque fora da plataforma
+    if usuario.id == admin.id and (
+        mudancas.get("ativo") is False or mudancas.get("papel", "ADMIN") != "ADMIN"
+    ):
+        raise ConflictError("Um ADMIN não pode rebaixar ou desativar a própria conta.")
 
-@router.patch(
-    "/usuarios/{usuario_id}/desativar",
-    response_model=UsuarioResponse,
-    summary="Desativar usuário mantendo histórico de auditoria (Requer ADMIN)",
-    tags=["Usuários"],
-)
-def desativar_usuario(
-    usuario_id: str,
-    db: Session = Depends(get_db),
-    admin: Usuario = Depends(require_roles("ADMIN")),
-):
-    alvo = db.query(Usuario).filter(Usuario.id == usuario_id).first()
-    if not alvo:
-        raise NotFoundError(f"Usuário '{usuario_id}' não encontrado.")
-
-    antes = {"ativo": alvo.ativo}
-    alvo.ativo = False
-    registrar_auditoria(
-        db=db,
-        id_usuario_ator=admin.id,
-        acao="DESATIVAR_USUARIO",
-        tipo_entidade="USUARIO",
-        id_entidade=alvo.id,
-        estado_antes=antes,
-        estado_depois={"ativo": False},
-    )
+    antes = estado_usuario(usuario)
+    for campo, valor in mudancas.items():
+        setattr(usuario, campo, valor)
+    registrar_auditoria(db, admin, "ATUALIZAR_USUARIO", "USUARIO", usuario.id,
+                        estado_antes=antes, estado_depois=estado_usuario(usuario))
     db.commit()
-    db.refresh(alvo)
-    return alvo
+    return usuario
+
+
+@router.delete("/usuarios/{id_usuario}", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Desativar usuário")
+def remover_usuario(
+    id_usuario: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: Usuario = Depends(requer_papel("ADMIN")),
+):
+    """
+    Desativa o usuário (ativo=false) em vez de apagar, para não quebrar o
+    histórico de auditoria. Tokens já emitidos param de valer na hora.
+    **Códigos:** 204 | 401 | 403 | 404 | 409 (ADMIN desativando a si mesmo)
+    """
+    usuario = _buscar_usuario(db, id_usuario)
+    if usuario.id == admin.id:
+        raise ConflictError("Um ADMIN não pode desativar a própria conta.")
+    antes = estado_usuario(usuario)
+    usuario.ativo = False
+    registrar_auditoria(db, admin, "DESATIVAR_USUARIO", "USUARIO", usuario.id,
+                        estado_antes=antes, estado_depois=estado_usuario(usuario))
+    db.commit()

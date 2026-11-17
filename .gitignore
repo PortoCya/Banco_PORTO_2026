@@ -10,8 +10,18 @@ env/
 .venv/
 .env/
 
-# Environment variables (NUNCA commitar .env com secrets)
+# Segredos: NUNCA vão para o git
 .env
+.env.*
+!.env.example
+!frontend/.env.local.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# Backups do banco (contêm dados pessoais)
+backups/
+*.dump
 
 # Banco de dados SQLite gerado localmente
 *.db
@@ -46,5 +56,3 @@ htmlcov/
 # mypy
 .mypy_cache/
 
-# Alembic (não versionar banco gerado)
-alembic/versions/*.pyc

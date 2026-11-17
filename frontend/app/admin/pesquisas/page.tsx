@@ -296,7 +296,7 @@ export default function GestaoPesquisas() {
                         <div className="survey-link-row" key={link.id}>
                           <span className={`survey-link-type ${link.tipo.toLowerCase()}`}>{link.tipo}</span>
                           <Link href={url} target="_blank" rel="noreferrer">{url}</Link>
-                          {link.usado_em && <span className="survey-link-used">Já utilizado</span>}
+                          {link.tipo === "NOMINAL" && link.usado_em && <span className="survey-link-used">Já utilizado</span>}
                         </div>
                       );
                     })}
