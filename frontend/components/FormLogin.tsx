@@ -1,7 +1,8 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
-import { ApiError, login, salvarToken } from "@/lib/api";
+import { ApiError, login, salvarToken, usuarioLogado } from "@/lib/api";
 
 export const SENHA_MIN = 12;
 export const SENHA_MAX = 128;
@@ -20,6 +21,7 @@ export function MensagemAuth({ mensagem }: { mensagem: Mensagem }) {
 export default function FormLogin() {
   const [mensagem, setMensagem] = useState<Mensagem>(null);
   const [enviando, setEnviando] = useState(false);
+  const router = useRouter();
 
   async function entrar(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -29,7 +31,16 @@ export default function FormLogin() {
     try {
       const token = await login(String(dados.get("email")), String(dados.get("senha")));
       salvarToken(token.access_token);
-      setMensagem({ tipo: "ok", texto: "Login realizado com sucesso." });
+      // O papel vem do backend (lido do banco), não do formulário
+      const usuario = await usuarioLogado();
+      if (usuario.papel === "ADMIN") {
+        router.push("/admin/pesquisas");
+        return;
+      }
+      setMensagem({
+        tipo: "ok",
+        texto: "Login realizado. Os indicadores de NPS ficam no dashboard de análise.",
+      });
     } catch (err) {
       setMensagem({
         tipo: "erro",

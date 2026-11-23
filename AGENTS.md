@@ -2,7 +2,7 @@
 
 Plataforma de pesquisa de satisfação/NPS da KeyCore. ADMIN cria e publica pesquisas, cliente responde pelo celular sem login, NPS é calculado automaticamente e toda ação é auditada. Uma camada de IA opcional sugere sentimento e tema dos comentários.
 
-> O código atual em `app/` (modelos como `Conversa`, `SoaIa`, `Gerenciacao`...) é de uma versão anterior e **não segue esta especificação**. Em caso de conflito, este arquivo é a fonte da verdade.
+> Em caso de conflito entre o código e este arquivo, este arquivo é a fonte da verdade. Como rodar: `README.md`. Plantão, backup e restore: `docs/OPERACAO.md`. Migrations: `alembic/README.md`.
 
 ## Regra de ouro
 
@@ -34,12 +34,14 @@ Já implementado. Reutilize, não reescreva:
 - **Rotas protegidas:** `Depends(get_usuario_atual)` ou `Depends(requer_papel("ADMIN"))` de `app/api/deps.py`. Toda rota não pública precisa de um dos dois; esconder botão no front não é controle de acesso.
 - **Senha:** só via `gerar_hash_senha`/`verificar_senha` (`app/core/security.py`, Argon2id). Senha de 12 a 128 caracteres. Nunca retornar `senha_hash` em resposta nem em auditoria.
 - **JWT:** HS256, `sub` = uuid do usuário, expira em `ACCESS_TOKEN_EXPIRE_MINUTES`. Papel e `ativo` são lidos do banco a cada requisição (desativar ou trocar papel vale na hora).
-- **Login:** erro sempre genérico ("E-mail ou senha inválidos."), sem revelar se o e-mail existe. Rate limit por IP e por e-mail (`app/core/rate_limit.py`, em memória; migrar para Redis mantendo a interface).
+- **Login:** erro sempre genérico ("E-mail ou senha inválidos."), sem revelar se o e-mail existe. Rate limit por IP e por e-mail (`app/core/rate_limit.py`: Redis quando `REDIS_URL` existe, com queda para memória por processo).
 - **Auditoria:** ação administrativa chama `registrar_auditoria(...)` (`app/services/auditoria.py`) antes do `commit`, na mesma transação.
 - **Segredos:** só por variável de ambiente (`.env`, ignorado pelo git). `SECRET_KEY` não tem padrão: sem ela a app não sobe.
 - **Logs:** nunca logar senha, token, hash ou o `input` de erros de validação.
 - **SQL:** sempre via ORM/parâmetros; nunca f-string em `text()`.
-- **Chamadas externas:** sempre com timeout explícito.
+- **Chamadas externas:** sempre com timeout explícito. Repetir só erro transitório (timeout, rede, 429, 5xx), com backoff.
+- **Migrations:** nunca apagar/renomear coluna no mesmo deploy que para de usá-la (expandir → contrair, ver `alembic/README.md`).
+- **Logs:** toda linha carrega `request_id` (`app/core/logs.py`).
 - **Primeiro ADMIN:** `ADMIN_EMAIL` e `ADMIN_SENHA` no `.env` + `python seed_db.py`.
 
 ## Regras do núcleo
@@ -125,4 +127,4 @@ Resumo automático de ciclo, clustering de comentários, multi-tenant, integraç
 
 ## Testes
 
-pytest. Obrigatório cobrir: cálculo de NPS (só promotores, só detratores, só neutros, 1 resposta, 0 respostas), duplicidade, mascaramento de PII em vários formatos, casos adversariais de prompt injection e falha do provedor sem impacto no NPS.
+pytest (`TEST_DATABASE_URL` roda a mesma suíte em PostgreSQL). Obrigatório cobrir: cálculo de NPS (só promotores, só detratores, só neutros, 1 resposta, 0 respostas), duplicidade, mascaramento de PII em vários formatos, casos adversariais de prompt injection e falha do provedor sem impacto no NPS.

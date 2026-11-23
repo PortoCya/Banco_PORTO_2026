@@ -1,175 +1,125 @@
 """
-Script utilitário: cria as 16 tabelas do banco NPS KeyCore v1.0 e popula dados iniciais seguros (seed).
-Execute: python seed_db.py
+Dados iniciais (idempotente — pode rodar de novo sem duplicar nada).
+
+    alembic upgrade head      # o schema vem das migrations, não daqui
+    python seed_db.py         # primeiro ADMIN + prompt e versão de modelo iniciais
+    python seed_db.py --demo  # também cria uma pesquisa publicada com link ABERTO
+    python seed_db.py --demo --demo-token nps-keycore-2026   # link de teste fixo (só em dev)
+
+O primeiro ADMIN vem de ADMIN_EMAIL / ADMIN_SENHA no ambiente (.env). Nenhuma
+senha fica no código nem aparece no log.
 """
+import argparse
 import logging
-from datetime import datetime
+import os
+import re
+import secrets
+import sys
 
-from app.core.database import Base, engine, SessionLocal
-from app.core.security import gerar_senha_hash
-from app.models.models import (
-    Usuario,
-    Pesquisa,
-    LinkPesquisa,
-    Prompt,
-    VersaoModelo,
-    ComentarioGoldenSet,
-    AvaliacaoGoldenSet,
-    SnapshotTelemetria,
-)
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+load_dotenv()
 
+from pydantic import ValidationError  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
-def criar_tabelas():
-    logger.info("Criando as 16 tabelas do NPS KeyCore v1.0...")
-    Base.metadata.create_all(bind=engine)
-    logger.info("Tabelas criadas com sucesso.")
+from app.core.database import SessionLocal  # noqa: E402
+from app.core.security import gerar_hash_senha  # noqa: E402
+from app.models.models import LinkPesquisa, Pesquisa, Prompt, Usuario, VersaoModelo  # noqa: E402
+from app.schemas.schemas import UsuarioCreate  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("seed")
+
+TITULO_DEMO = "Pesquisa de Satisfação KeyCore (demonstração)"
 
 
-def popular_dados():
-    db = SessionLocal()
+def _admin_do_ambiente() -> UsuarioCreate:
     try:
-        # 1. Usuários padrão (ADMIN e ANALYST) com hash forte PBKDF2-HMAC-SHA256
-        admin = db.query(Usuario).filter(Usuario.email == "admin@keycore.com.br").first()
-        if not admin:
-            admin = Usuario(
-                nome="Admin KeyCore",
-                email="admin@keycore.com.br",
-                senha_hash=gerar_senha_hash("Admin@KeyCore2026!"),
-                papel="ADMIN",
-                ativo=True,
-            )
+        return UsuarioCreate(
+            nome=os.environ.get("ADMIN_NOME", "Administrador"),
+            email=os.environ.get("ADMIN_EMAIL", ""),
+            senha=os.environ.get("ADMIN_SENHA", ""),
+            papel="ADMIN",
+        )
+    except ValidationError as exc:
+        campos = sorted({str(e["loc"][0]) for e in exc.errors()})
+        sys.exit(f"Defina ADMIN_EMAIL e ADMIN_SENHA (12 a 128 caracteres) no .env. Inválido: {', '.join(campos)}")
+
+
+def _garantir_demo(db, admin: Usuario, demo_token: str | None) -> None:
+    """Pesquisa publicada + link ABERTO para testar o fluxo do respondente. Idempotente."""
+    pesquisa = db.execute(select(Pesquisa).where(Pesquisa.titulo == TITULO_DEMO)).scalar_one_or_none()
+    if pesquisa is None:
+        pesquisa = Pesquisa(
+            titulo=TITULO_DEMO,
+            texto_pergunta_nps="Em uma escala de 0 a 10, o quanto você recomendaria a KeyCore?",
+            texto_pergunta_aberta="Qual foi o principal motivo para a sua nota?",
+            status="PUBLICADA",
+            criado_por=admin.id,
+        )
+        db.add(pesquisa)
+        db.flush()
+        logger.info("Pesquisa de demonstração publicada.")
+
+    if demo_token:
+        link = db.execute(select(LinkPesquisa).where(LinkPesquisa.token == demo_token)).scalar_one_or_none()
+        if link is not None and link.id_pesquisa != pesquisa.id:
+            sys.exit(f"O token '{demo_token}' já pertence a outra pesquisa. Escolha outro.")
+    else:
+        link = db.execute(
+            select(LinkPesquisa)
+            .where(LinkPesquisa.id_pesquisa == pesquisa.id, LinkPesquisa.tipo == "ABERTO")
+            .order_by(LinkPesquisa.criado_em.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    if link is None:
+        link = LinkPesquisa(id_pesquisa=pesquisa.id, tipo="ABERTO",
+                            token=demo_token or secrets.token_urlsafe(24))
+        db.add(link)
+    logger.info("Link público de teste: /pesquisa/%s", link.token)
+
+
+def popular(demo: bool, demo_token: str | None = None) -> None:
+    dados = _admin_do_ambiente()
+    with SessionLocal() as db:
+        admin = db.execute(select(Usuario).where(Usuario.email == dados.email)).scalar_one_or_none()
+        if admin is None:
+            admin = Usuario(nome=dados.nome, email=dados.email,
+                            senha_hash=gerar_hash_senha(dados.senha), papel="ADMIN")
             db.add(admin)
             db.flush()
+            logger.info("ADMIN criado: %s", dados.email)
         else:
-            # Seed de desenvolvimento: garante que as credenciais documentadas funcionem localmente.
-            admin.nome = "Admin KeyCore"
-            admin.senha_hash = gerar_senha_hash("Admin@KeyCore2026!")
-            admin.papel = "ADMIN"
-            admin.ativo = True
+            logger.info("ADMIN já existe: %s (senha não alterada)", dados.email)
 
-        analista = db.query(Usuario).filter(Usuario.email == "analista@keycore.com.br").first()
-        if not analista:
-            analista = Usuario(
-                nome="Analista KeyCore",
-                email="analista@keycore.com.br",
-                senha_hash=gerar_senha_hash("Analista@KeyCore2026!"),
-                papel="ANALYST",
-                ativo=True,
-            )
-            db.add(analista)
-            db.flush()
-
-        # 2. Prompt e VersaoModelo (Google Gemini gratuito por padrão)
-        if not db.query(Prompt).first():
+        if db.execute(select(Prompt.id).limit(1)).first() is None:
             prompt = Prompt(
-                objetivo="Classificar sentimento e tema de feedbacks NPS com alta precisão e sem alucinação.",
-                contexto="Comentários abertos de clientes respondendo pesquisas de satisfação NPS da KeyCore.",
-                saida_esperada='JSON estrito com {"sentimento": "POSITIVO|NEUTRO|NEGATIVO", "tema": "...", "confianca": 0.0-1.0, "justificativa": "..."}',
-                problemas_encontrados="Nenhum. PII mascarado previamente no backend antes do envio.",
+                objetivo="Classificar o sentimento e o tema de comentários de pesquisas de satisfação (NPS).",
+                contexto="Comentários livres, em português, de clientes da KeyCore. Dados pessoais já vêm mascarados.",
+                saida_esperada="JSON com sentimento, tema, confianca e justificativa curta.",
             )
             db.add(prompt)
             db.flush()
+            # Nasce INATIVA: só ativa depois de aprovada no golden set
+            # (POST /golden-set/avaliacoes e POST /modelos-ia/{id}/ativar).
+            db.add(VersaoModelo(provedor="Google Gemini", nome_modelo="gemini-2.5-flash",
+                                rotulo_versao="gemini-2.5-flash-v1", id_prompt=prompt.id, ativo=False))
+            logger.info("Prompt e versão de modelo iniciais criados (modelo inativo até passar no golden set).")
 
-            versao = VersaoModelo(
-                provedor="Google Gemini",
-                nome_modelo="gemini-2.0-flash",
-                rotulo_versao="gemini-2.0-flash-v1.0",
-                id_prompt=prompt.id,
-                ativa=True,
-            )
-            db.add(versao)
-            db.flush()
+        if demo:
+            _garantir_demo(db, admin, demo_token)
 
-            avaliacao = AvaliacaoGoldenSet(
-                id_versao_modelo=versao.id,
-                acuracia_sentimento=0.9450,
-                acuracia_tema=0.9120,
-                taxa_falso_positivo=0.0210,
-                status="APROVADO",
-            )
-            db.add(avaliacao)
-
-        # 3. Pesquisa publicada e link aberto estável para teste imediato
-        titulo_pesquisa_teste = "Pesquisa Oficial de Satisfação NPS KeyCore 2026"
-        pesquisa = db.query(Pesquisa).filter(Pesquisa.titulo == titulo_pesquisa_teste).first()
-        if not pesquisa:
-            pesquisa = Pesquisa(
-                titulo=titulo_pesquisa_teste,
-                texto_pergunta_nps="Em uma escala de 0 a 10, o quanto você recomendaria a KeyCore para um colega ou parceiro?",
-                texto_pergunta_aberta="Qual foi o principal motivo para a sua nota?",
-                status="PUBLICADA",
-                numero_versao=1,
-                criado_por=admin.id,
-            )
-            db.add(pesquisa)
-            db.flush()
-        else:
-            pesquisa.status = "PUBLICADA"
-
-        token_teste = "nps-keycore-2026"
-        link_aberto = db.query(LinkPesquisa).filter(
-            LinkPesquisa.id_pesquisa == pesquisa.id,
-            LinkPesquisa.token == token_teste,
-        ).first()
-        if not link_aberto:
-            sufixo = 2
-            while True:
-                token_ocupado = db.query(LinkPesquisa).filter(LinkPesquisa.token == token_teste).first()
-                if not token_ocupado:
-                    link_aberto = LinkPesquisa(
-                        id_pesquisa=pesquisa.id,
-                        tipo="ABERTO",
-                        token=token_teste,
-                    )
-                    db.add(link_aberto)
-                    break
-                if token_ocupado.id_pesquisa == pesquisa.id and token_ocupado.tipo == "ABERTO":
-                    link_aberto = token_ocupado
-                    break
-                token_teste = f"nps-keycore-2026-{sufixo}"
-                sufixo += 1
-
-        # 4. Comentário Golden Set e Telemetria inicial
-        if not db.query(ComentarioGoldenSet).first():
-            db.add(
-                ComentarioGoldenSet(
-                    texto_comentario="O suporte técnico resolveu meu chamado em 5 minutos, excelente!",
-                    rotulo_sentimento_humano="POSITIVO",
-                    rotulo_tema_humano="SUPORTE",
-                )
-            )
-
-        if not db.query(SnapshotTelemetria).first():
-            db.add(
-                SnapshotTelemetria(
-                    inicio_janela=datetime.utcnow(),
-                    fim_janela=datetime.utcnow(),
-                    latencia_p50_ms=42,
-                    latencia_p95_ms=115,
-                    taxa_erro_5xx=0.0,
-                    pct_descartado_ec12=0.0,
-                    pct_descartado_ec13=0.0,
-                    qtd_pii_mascaramento_falhou=0,
-                    status_circuit_breaker="FECHADO",
-                )
-            )
-
-        db.commit()
-        logger.info("Dados iniciais inseridos com sucesso.")
-        logger.info("Acesso ADMIN de desenvolvimento: admin@keycore.com.br")
-        logger.info("Link público de teste: /pesquisa/%s", token_teste)
-
-    except Exception as exc:
-        db.rollback()
-        logger.error("Erro ao popular banco: %s", exc)
-        raise
-    finally:
-        db.close()
+        db.commit()   # tudo ou nada
 
 
 if __name__ == "__main__":
-    criar_tabelas()
-    popular_dados()
+    parser = argparse.ArgumentParser(description="Popula os dados iniciais.")
+    parser.add_argument("--demo", action="store_true", help="cria também uma pesquisa de demonstração")
+    parser.add_argument("--demo-token", metavar="TOKEN",
+                        help="token fixo para o link ABERTO da demonstração (só desenvolvimento; "
+                             "8 a 128 caracteres: letras, números, _ ou -)")
+    args = parser.parse_args()
+    if args.demo_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", args.demo_token):
+        sys.exit("--demo-token inválido: use 8 a 128 caracteres (letras, números, _ ou -).")
+    popular(args.demo, args.demo_token)

@@ -1,25 +1,40 @@
 "use client";
 
+/**
+ * Página pública do respondente (sem login): /pesquisa/{token}
+ *
+ * A pesquisa é carregada no navegador, não no servidor do Next: assim o rate
+ * limit por IP da API vale para cada respondente (e não para o IP do servidor)
+ * e o cookie que barra a segunda resposta no link ABERTO chega à API.
+ */
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import {
   ApiError,
   carregarPesquisaPublica,
-  enviarSubmissaoPublica,
+  enviarResposta,
   PesquisaPublicaResponse,
 } from "@/lib/api";
 
 function mensagemErro(erro: unknown, carregandoPesquisa = false) {
-  if (!(erro instanceof ApiError)) return "Não foi possível conectar à pesquisa. Verifique sua conexão e tente novamente.";
-  if (erro.status === 409) return "Este link já foi utilizado ou esta resposta já foi registrada.";
-  if (erro.status === 422) return `Confira os dados da resposta. ${erro.message}`;
-  if (erro.status === 404) return "Link de pesquisa inválido ou expirado.";
-  if (erro.status === 403 || erro.status === 400) {
-    return carregandoPesquisa
-      ? "Esta pesquisa não está publicada ou não está recebendo respostas."
-      : erro.message;
+  if (!(erro instanceof ApiError) || erro.status === 0) {
+    return "Não foi possível conectar à pesquisa. Verifique sua conexão e tente novamente.";
   }
-  return erro.message || "Ocorreu um erro. Tente novamente.";
+  // 409 não diz qual regra barrou (link nominal usado, mesmo navegador, reenvio)
+  if (erro.status === 409) return "Esta pesquisa já foi respondida. Obrigado!";
+  if (erro.status === 422) {
+    return carregandoPesquisa ? "Link de pesquisa inválido." : "Confira a nota e o comentário e tente de novo.";
+  }
+  if (erro.status === 404) return "Link de pesquisa inválido.";
+  if (erro.status === 403) return "Esta pesquisa não está recebendo respostas no momento.";
+  if (erro.status === 429) return "Muitas tentativas. Aguarde um instante e tente de novo.";
+  return "Ocorreu um erro. Tente novamente.";
+}
+
+function novaChave(): string {
+  // randomUUID só existe em HTTPS/localhost; fora disso usa getRandomValues
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export default function ResponderPesquisa() {
@@ -32,6 +47,8 @@ export default function ResponderPesquisa() {
   const [enviando, setEnviando] = useState(false);
   const [enviada, setEnviada] = useState(false);
   const [erro, setErro] = useState<string | null>(null);
+  // Uma chave por formulário aberto: reenviar após falha de rede usa a mesma,
+  // e a API nunca conta a resposta duas vezes.
   const chaveIdempotencia = useRef<string | null>(null);
 
   useEffect(() => {
@@ -63,9 +80,8 @@ export default function ResponderPesquisa() {
     setEnviando(true);
     setErro(null);
     try {
-      chaveIdempotencia.current ??= crypto.randomUUID();
-      await enviarSubmissaoPublica({
-        token_link: token,
+      chaveIdempotencia.current ??= novaChave();
+      await enviarResposta(token, {
         nota_nps: nota,
         texto_comentario: comentario.trim() || null,
         chave_idempotencia: chaveIdempotencia.current,
@@ -114,6 +130,8 @@ export default function ResponderPesquisa() {
     );
   }
 
+  const maxComentario = pesquisa.comentario_max_caracteres;
+
   return (
     <section className="public-survey-wrap">
       <article className="public-survey-card">
@@ -133,21 +151,25 @@ export default function ResponderPesquisa() {
             <legend>{pesquisa.texto_pergunta_nps}</legend>
             <p className="nps-instruction">Toque na nota que melhor representa sua opinião.</p>
             <div className="nps-scale" role="radiogroup" aria-label="Nota NPS de 0 a 10">
-              {Array.from({ length: 11 }, (_, valor) => (
-                <button
-                  key={valor}
-                  type="button"
-                  role="radio"
-                  aria-checked={nota === valor}
-                  className={`nps-score${nota === valor ? " selected" : ""}`}
-                  onClick={() => {
-                    setNota(valor);
-                    setErro(null);
-                  }}
-                >
-                  {valor}
-                </button>
-              ))}
+              {Array.from({ length: pesquisa.nota_maxima - pesquisa.nota_minima + 1 }, (_, i) => {
+                const valor = pesquisa.nota_minima + i;
+                const faixa = valor >= 9 ? "promotor" : valor >= 7 ? "neutro" : "detrator";
+                return (
+                  <button
+                    key={valor}
+                    type="button"
+                    role="radio"
+                    aria-checked={nota === valor}
+                    className={`nps-score ${faixa}${nota === valor ? " selected" : ""}`}
+                    onClick={() => {
+                      setNota(valor);
+                      setErro(null);
+                    }}
+                  >
+                    {valor}
+                  </button>
+                );
+              })}
             </div>
             <div className="nps-scale-labels"><span>Pouco provável</span><span>Muito provável</span></div>
           </fieldset>
@@ -158,11 +180,11 @@ export default function ResponderPesquisa() {
               <textarea
                 value={comentario}
                 onChange={(e) => setComentario(e.target.value)}
-                maxLength={2000}
+                maxLength={maxComentario}
                 rows={4}
                 placeholder="Escreva sua resposta aqui..."
               />
-              <span className="comment-counter">{comentario.length}/2000 caracteres</span>
+              <span className="comment-counter">{comentario.length}/{maxComentario} caracteres</span>
             </label>
           )}
 

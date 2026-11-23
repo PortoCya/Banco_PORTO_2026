@@ -1,18 +1,21 @@
 """
-Dependencies de autenticação e autorização para as rotas.
+Dependencies comuns das rotas: autenticação, autorização e paginação.
 
 Uso:
-    @router.post("/pesquisas", dependencies=[Depends(requer_papel("ADMIN"))])
-    def criar(..., usuario: Usuario = Depends(get_usuario_atual)): ...
+    @router.post("/pesquisas")
+    def criar(..., admin: Usuario = Depends(requer_papel("ADMIN"))): ...
 """
-from fastapi import Depends
+from dataclasses import dataclass
+
+from fastapi import Depends, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.errors import ForbiddenError, NotFoundError, UnauthorizedError
+from app.core.errors import ForbiddenError, TooManyRequestsError, UnauthorizedError
+from app.core.rate_limit import RateLimiter
 from app.core.security import decodificar_token
-from app.models.models import Conversa, Gerenciacao, Usuario
+from app.models.models import Usuario
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -33,7 +36,7 @@ def get_usuario_atual(
     if id_usuario is None:
         raise UnauthorizedError("Token inválido ou expirado.")
 
-    usuario = db.query(Usuario).filter(Usuario.uuid == id_usuario).first()
+    usuario = db.get(Usuario, id_usuario)
     if usuario is None or not usuario.ativo:
         raise UnauthorizedError("Token inválido ou expirado.")
     return usuario
@@ -48,24 +51,32 @@ def requer_papel(*papeis: str):
     return _verificar
 
 
-def e_dono_ou_admin(usuario: Usuario, id_dono: str | None) -> bool:
-    """ADMIN vê tudo; os demais só o que é deles."""
-    return usuario.papel == "ADMIN" or id_dono == usuario.uuid
+@dataclass(frozen=True)
+class Paginacao:
+    skip: int
+    limit: int
 
 
-# ─── Busca com checagem de dono ──────────────────────────────────────────────
-# Respondem 404 tanto se não existe quanto se é de outro usuário, para não
-# revelar que o registro existe.
-
-def buscar_conversa_do_usuario(db: Session, uuid: str, usuario: Usuario) -> Conversa:
-    conversa = db.query(Conversa).filter(Conversa.uuid == uuid).first()
-    if not conversa or not e_dono_ou_admin(usuario, conversa.fk_usuario):
-        raise NotFoundError(f"Conversa '{uuid}' não encontrada.")
-    return conversa
+def paginacao(
+    skip: int = Query(0, ge=0, le=1_000_000),
+    limit: int = Query(50, ge=1, le=200),
+) -> Paginacao:
+    return Paginacao(skip, limit)
 
 
-def buscar_gerenciacao_do_usuario(db: Session, uuid: str, usuario: Usuario) -> Gerenciacao:
-    g = db.query(Gerenciacao).filter(Gerenciacao.uuid == uuid).first()
-    if not g or not e_dono_ou_admin(usuario, g.fk_pessoa):
-        raise NotFoundError(f"Gerenciação '{uuid}' não encontrada.")
-    return g
+def ip_do_cliente(request: Request) -> str:
+    # Atrás de proxy, suba o uvicorn com --proxy-headers e --forwarded-allow-ips
+    # apontando para o proxy; nunca leia X-Forwarded-For direto (é forjável).
+    return request.client.host if request.client else "desconhecido"
+
+
+def limite_por_ip(limiter: RateLimiter):
+    """Dependency: conta a requisição por IP e responde 429 acima do limite."""
+    def _verificar(request: Request) -> None:
+        ip = ip_do_cliente(request)
+        if limiter.bloqueado(ip):
+            raise TooManyRequestsError(
+                "Muitas requisições. Tente novamente em instantes.", retry_after=limiter.janela
+            )
+        limiter.registrar(ip)
+    return _verificar

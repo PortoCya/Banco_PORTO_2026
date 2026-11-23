@@ -30,6 +30,7 @@ def test_login_ok(client):
     r = client.post(LOGIN, json={"email": "A@X.com", "senha": SENHA})
     assert r.status_code == 200
     assert r.json()["token_type"] == "bearer"
+    assert r.json()["expires_in"] == settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
 
 
 def test_login_erro_generico(client):
@@ -39,7 +40,8 @@ def test_login_erro_generico(client):
     inexistente = client.post(LOGIN, json={"email": "nao@x.com", "senha": SENHA})
     inativo = client.post(LOGIN, json={"email": "inativo@x.com", "senha": SENHA})
     assert senha_errada.status_code == inexistente.status_code == inativo.status_code == 401
-    assert senha_errada.json() == inexistente.json() == inativo.json()
+    corpos = [r.json()["error"] | {"correlation_id": None} for r in (senha_errada, inexistente, inativo)]
+    assert corpos[0] == corpos[1] == corpos[2]
 
 
 def test_me_retorna_usuario_sem_hash(client):
@@ -64,18 +66,37 @@ def test_validacao_nao_vaza_senha(client, caplog):
     assert senha not in caplog.text
 
 
+def test_login_rejeita_campo_desconhecido(client):
+    r = client.post(LOGIN, json={"email": "a@x.com", "senha": SENHA, "papel": "ADMIN"})
+    assert r.status_code == 422
+
+
 def test_rate_limit_por_email(client):
     criar_usuario("a@x.com")
     for _ in range(settings.LOGIN_MAX_FALHAS_EMAIL):
         assert client.post(LOGIN, json={"email": "a@x.com", "senha": "errada"}).status_code == 401
-    # Bloqueia até a senha certa
-    assert client.post(LOGIN, json={"email": "a@x.com", "senha": SENHA}).status_code == 429
+    # Bloqueia até a senha certa, e avisa quando tentar de novo
+    r = client.post(LOGIN, json={"email": "a@x.com", "senha": SENHA})
+    assert r.status_code == 429
+    assert int(r.headers["Retry-After"]) > 0
 
 
 def test_rate_limit_por_ip(client):
     for i in range(settings.LOGIN_MAX_TENTATIVAS_IP):
         client.post(LOGIN, json={"email": f"u{i}@x.com", "senha": "errada"})
     assert client.post(LOGIN, json={"email": "novo@x.com", "senha": "errada"}).status_code == 429
+
+
+def test_rate_limit_compartilhado_no_redis(client, redis_falso):
+    criar_usuario("a@x.com")
+    for _ in range(settings.LOGIN_MAX_FALHAS_EMAIL):
+        client.post(LOGIN, json={"email": "a@x.com", "senha": "errada"})
+    # Outro processo da API = contador em memória zerado; o Redis ainda bloqueia
+    from app.api.v1.endpoints import auth
+    auth.limite_email.limpar_tudo()
+    auth.limite_ip.limpar_tudo()
+    assert client.post(LOGIN, json={"email": "a@x.com", "senha": SENHA}).status_code == 429
+    assert redis_falso.keys("ratelimit:login_email:*")
 
 
 # ─── Token ───────────────────────────────────────────────────────────────────
@@ -87,23 +108,27 @@ def test_rota_protegida_sem_token_ou_token_invalido(client):
 
 def test_token_expirado(client):
     uid = criar_usuario("adm@x.com", papel="ADMIN")
-    expirado = jwt.encode({"sub": uid, "iat": 0, "exp": 1}, settings.SECRET_KEY, algorithm="HS256")
+    expirado = jwt.encode({"sub": str(uid), "iat": 0, "exp": 1}, settings.SECRET_KEY, algorithm="HS256")
     assert client.get("/api/v1/usuarios", headers=auth_header(expirado)).status_code == 401
 
 
 def test_token_assinado_com_outra_chave(client):
     uid = criar_usuario("adm@x.com", papel="ADMIN")
-    falso = jwt.encode({"sub": uid, "iat": 0, "exp": 9999999999}, "outra-chave" * 4, algorithm="HS256")
+    falso = jwt.encode({"sub": str(uid), "iat": 0, "exp": 9999999999}, "outra-chave" * 4, algorithm="HS256")
     assert client.get("/api/v1/usuarios", headers=auth_header(falso)).status_code == 401
+
+
+def test_token_com_sub_que_nao_e_uuid(client):
+    t = jwt.encode({"sub": "1 OR 1=1", "iat": 0, "exp": 9999999999}, settings.SECRET_KEY, algorithm="HS256")
+    assert client.get("/api/v1/usuarios", headers=auth_header(t)).status_code == 401
 
 
 def test_usuario_desativado_perde_acesso_na_hora(client):
     uid = criar_usuario("adm@x.com", papel="ADMIN")
     t = token(client, "adm@x.com")
-    db = SessionLocal()
-    db.get(Usuario, uid).ativo = False
-    db.commit()
-    db.close()
+    with SessionLocal() as db:
+        db.get(Usuario, uid).ativo = False
+        db.commit()
     assert client.get("/api/v1/usuarios", headers=auth_header(t)).status_code == 401
 
 
@@ -121,17 +146,24 @@ def test_admin_cria_usuario_sem_expor_hash_e_audita(client):
     criar_usuario("adm@x.com", papel="ADMIN")
     t = token(client, "adm@x.com")
     r = client.post("/api/v1/usuarios", headers=auth_header(t),
-                    json={"nome": "Novo", "email": "n@x.com", "senha": SENHA, "papel": "ANALYST"})
+                    json={"nome": "Novo", "email": "N@x.com", "senha": SENHA, "papel": "ANALYST"})
     assert r.status_code == 201
     assert "senha" not in r.text and "hash" not in r.text
     # Novo usuário consegue logar
     token(client, "n@x.com")
 
-    db = SessionLocal()
-    log = db.query(LogAuditoria).filter_by(acao="CRIAR_USUARIO").one()
-    assert log.estado_depois["papel"] == "ANALYST"
-    assert "senha_hash" not in log.estado_depois
-    db.close()
+    with SessionLocal() as db:
+        log = db.query(LogAuditoria).filter_by(acao="CRIAR_USUARIO").one()
+        assert log.estado_depois["papel"] == "ANALYST"
+        assert "senha_hash" not in log.estado_depois
+
+
+def test_email_duplicado_retorna_409(client):
+    criar_usuario("adm@x.com", papel="ADMIN")
+    h = auth_header(token(client, "adm@x.com"))
+    corpo = {"nome": "Novo", "email": "n@x.com", "senha": SENHA}
+    assert client.post("/api/v1/usuarios", headers=h, json=corpo).status_code == 201
+    assert client.post("/api/v1/usuarios", headers=h, json=corpo).status_code == 409
 
 
 def test_senha_curta_rejeitada(client):
@@ -154,10 +186,9 @@ def test_troca_de_papel_auditada_e_vale_na_hora(client):
     # Mesmo token antigo já ganha o novo papel
     assert client.get("/api/v1/usuarios", headers=auth_header(t_an)).status_code == 200
 
-    db = SessionLocal()
-    log = db.query(LogAuditoria).filter_by(acao="ATUALIZAR_USUARIO").one()
-    assert (log.estado_antes["papel"], log.estado_depois["papel"]) == ("ANALYST", "ADMIN")
-    db.close()
+    with SessionLocal() as db:
+        log = db.query(LogAuditoria).filter_by(acao="ATUALIZAR_USUARIO").one()
+        assert (log.estado_antes["papel"], log.estado_depois["papel"]) == ("ANALYST", "ADMIN")
 
 
 def test_admin_nao_se_tranca_fora(client):
@@ -174,6 +205,5 @@ def test_delete_desativa_em_vez_de_apagar(client):
     uid = criar_usuario("an@x.com")
     t = token(client, "adm@x.com")
     assert client.delete(f"/api/v1/usuarios/{uid}", headers=auth_header(t)).status_code == 204
-    db = SessionLocal()
-    assert db.get(Usuario, uid).ativo is False
-    db.close()
+    with SessionLocal() as db:
+        assert db.get(Usuario, uid).ativo is False
