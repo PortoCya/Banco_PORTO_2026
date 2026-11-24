@@ -190,12 +190,12 @@ def carregar_respostas(token: str, id_pesquisa: str, inicio: date, fim: date) ->
         # datas da API vêm em UTC; o painel mostra no fuso de São Paulo
         "data": pd.to_datetime(df["criada_em"], utc=True)
                   .dt.tz_convert("America/Sao_Paulo").dt.tz_localize(None),
-        "nota": df["nota_nps"].astype(int),
+        "nota": pd.to_numeric(df["nota_nps"], errors="coerce").fillna(0).astype(int),
         "faixa": df["faixa_nps"].map(FAIXA_LABEL),
-        "comentario": df["texto_comentario"].fillna(""),
+        "comentario": df["texto_comentario"].fillna("").astype(str),
         "sentimento_ia": df["sentimento"].map(SENTIMENTO_LABEL),
         "tema_ia": df["tema"].map(TEMA_LABEL),
-        "confianca_ia": df["confianca"],
+        "confianca_ia": pd.to_numeric(df["confianca"], errors="coerce"),
         "justificativa_ia": df["justificativa"],
         "status_ia": df["status_analise"].map(STATUS_IA_LABEL),
     })
@@ -262,10 +262,14 @@ def ranquear(df: pd.DataFrame, melhores: bool, n: int = 5) -> pd.DataFrame:
     pela confiança (só análises concluídas) e, por fim, a resposta mais
     recente. A IA só desempata: nunca muda a nota.
     """
-    com_texto = df[df["comentario"].str.strip() != ""].copy()
-    sinal = com_texto["sentimento_ia"].map({"Positivo": 1, "Neutro": 0, "Negativo": -1})
+    com_texto = df[df["comentario"].astype(str).str.strip() != ""].copy()
+    sinal = pd.to_numeric(
+        com_texto["sentimento_ia"].map({"Positivo": 1, "Neutro": 0, "Negativo": -1}),
+        errors="coerce",
+    ).fillna(0.0)
+    confianca = pd.to_numeric(com_texto["confianca_ia"], errors="coerce").fillna(0.0)
     valido = com_texto["status_ia"] == "Concluída"
-    com_texto["_ia"] = (sinal * com_texto["confianca_ia"]).where(valido, 0).fillna(0)
+    com_texto["_ia"] = (sinal * confianca).where(valido, 0.0).fillna(0.0)
     return com_texto.sort_values(
         ["nota", "_ia", "data"], ascending=[not melhores, not melhores, False]
     ).head(n)
@@ -317,8 +321,8 @@ def kpi_grid_delta(itens: list[tuple[str, str, float | None, bool]]) -> None:
 def card_resposta(r) -> str:
     """Card de uma resposta. Comentário vem do cliente: sempre escapado."""
     cor = FAIXA_COLOR[r.faixa]
-    if r.status_ia in ("Concluída", "Baixa confiança") and pd.notna(r.sentimento_ia):
-        ia = f"{escape(r.sentimento_ia)} · {escape(r.tema_ia)} · {r.confianca_ia:.0%} de confiança"
+    if r.status_ia in ("Concluída", "Baixa confiança") and pd.notna(r.sentimento_ia) and pd.notna(r.confianca_ia):
+        ia = f"{escape(str(r.sentimento_ia))} · {escape(str(r.tema_ia))} · {float(r.confianca_ia):.0%} de confiança"
         if r.status_ia == "Baixa confiança":
             ia += " (baixa, fora das contagens)"
         if isinstance(r.justificativa_ia, str) and r.justificativa_ia:
@@ -330,13 +334,13 @@ def card_resposta(r) -> str:
         f'<div class="resp-top"><span class="nota" style="background:{cor}">{r.nota}</span>'
         f'<span class="resp-meta">{r.faixa} · {r.data:%d/%m/%Y}</span></div>'
         f'<div class="resp-txt">“{escape(r.comentario)}”</div>'
-        f'<div class="resp-ia">🤖 Análise sugerida: {ia}</div>'
+        f'<div class="resp-ia">Análise sugerida: {ia}</div>'
         "</div>"
     )
 
 
 AVISO_IA = (
-    "🤖 *Sugerido* = análise sugerida pela IA, feita automaticamente pelo worker depois de "
+    "*Sugerido* = análise sugerida pela IA, feita automaticamente pelo worker depois de "
     "cada resposta (dados pessoais mascarados antes do envio). Confiança abaixo de 60% fica "
     "como baixa confiança e fora das contagens. A IA nunca altera a nota nem o NPS."
 )
@@ -350,11 +354,15 @@ if "token" not in st.session_state:
 usuario = st.session_state["usuario"]
 pesquisas = chamar(carregar_pesquisas, st.session_state["token"])
 
-col_title, col_user = st.columns([5, 1], vertical_alignment="center")
+col_title, col_user = st.columns([4, 2], vertical_alignment="center")
 col_title.title("NPS")
 with col_user:
     st.caption(f"{escape(usuario['nome'])} · {usuario['papel']}")
-    if st.button("Sair", width="stretch"):
+    btn_refresh, btn_logout = st.columns(2)
+    if btn_refresh.button("Atualizar", width="stretch"):
+        st.cache_data.clear()
+        st.rerun()
+    if btn_logout.button("Sair", width="stretch"):
         sair()
         st.rerun()
 
@@ -384,13 +392,13 @@ with tab_overview:
     qualitativas = lambda df: int((df["comentario"].str.strip() != "").sum())
     analisadas = lambda df: int((df["status_ia"] == "Concluída").sum())
     kpi_grid_delta([
-        ("📊 NPS", fmt_nps(nps_at["valor_nps"]),
+        ("NPS", fmt_nps(nps_at["valor_nps"]),
          variacao_pct(nps_at["valor_nps"], nps_ant["valor_nps"]), False),
-        ("💬 Total de respostas", fmt_int(nps_at["total_respostas"]),
+        ("Total de respostas", fmt_int(nps_at["total_respostas"]),
          variacao_pct(nps_at["total_respostas"], nps_ant["total_respostas"]), False),
-        ("✅ Respostas qualitativas", fmt_int(qualitativas(atual)),
+        ("Respostas qualitativas", fmt_int(qualitativas(atual)),
          variacao_pct(qualitativas(atual), qualitativas(anterior)), False),
-        ("🤖 Analisadas pela IA", fmt_int(analisadas(atual)),
+        ("Analisadas pela IA", fmt_int(analisadas(atual)),
          variacao_pct(analisadas(atual), analisadas(anterior)), False),
     ])
     st.caption(f"Variação comparada aos {dias} dias anteriores. NPS calculado pela API.")
@@ -442,13 +450,13 @@ with tab_overview:
             d1.plotly_chart(donut, width="stretch", config=PLOT_CFG)
 
             legend = ""
-            for icon, label, val, color in [
-                ("😊", "Promotores", promoters, GREEN),
-                ("😐", "Neutros", passives, MUTED),
-                ("☹️", "Detratores", detractors, RED),
+            for label, val, color in [
+                ("Promotores", promoters, GREEN),
+                ("Neutros", passives, MUTED),
+                ("Detratores", detractors, RED),
             ]:
                 legend += (
-                    f'<div class="legend-item"><span style="color:{color}">{icon}</span> '
+                    f'<div class="legend-item"><span class="dot" style="background:{color}"></span>'
                     f"{label}<br><b>{val} ({val / total:.0%})</b></div>"
                 )
             d2.markdown(legend, unsafe_allow_html=True)
@@ -496,12 +504,12 @@ with tab_responses:
         # -------------------------------------------------------- Resumo
         com_texto = (resp["comentario"].str.strip() != "").mean()
         kpi_grid([
-            ("📊 NPS do período", fmt_nps(nps_at["valor_nps"])),
-            ("💬 Respostas", fmt_int(len(resp))),
-            ("⭐ Nota média", f"{resp['nota'].mean():.1f}".replace(".", ",")),
-            ("✍️ Com comentário", f"{com_texto:.0%}"),
+            ("NPS do período", fmt_nps(nps_at["valor_nps"])),
+            ("Respostas", fmt_int(len(resp))),
+            ("Nota média", f"{resp['nota'].mean():.1f}".replace(".", ",")),
+            ("Com comentário", f"{com_texto:.0%}"),
             # baixa confiança fica fora das contagens
-            ("🤖 Analisadas pela IA", fmt_int(int((resp["status_ia"] == "Concluída").sum()))),
+            ("Analisadas pela IA", fmt_int(int((resp["status_ia"] == "Concluída").sum()))),
         ])
 
         # -------------------------------------------------------- Distribuição
@@ -522,17 +530,17 @@ with tab_responses:
         # -------------------------------------------------------- Melhores x piores
         m1, m2 = st.columns(2)
         with m1, st.container(border=True):
-            st.subheader("😊 Melhores respostas")
+            st.subheader("Melhores respostas")
             st.markdown("".join(card_resposta(r) for r in ranquear(resp, True).itertuples()),
                         unsafe_allow_html=True)
         with m2, st.container(border=True):
-            st.subheader("☹️ Piores respostas")
+            st.subheader("Piores respostas")
             st.markdown("".join(card_resposta(r) for r in ranquear(resp, False).itertuples()),
                         unsafe_allow_html=True)
 
         # -------------------------------------------------------- Reclamações por tema
         with st.container(border=True):
-            st.subheader("🚨 Reclamações por tema (análise sugerida)")
+            st.subheader("Reclamações por tema (análise sugerida)")
             st.caption("Detratores e neutros com análise concluída, agrupados pelo tema sugerido.")
             reclamacoes = resp[(resp["status_ia"] == "Concluída") & (resp["faixa"] != "Promotor")
                                & resp["tema_ia"].notna()]
@@ -601,7 +609,7 @@ with tab_responses:
                 ~exp["comentario"].str.match(r"^[=+\-@]"), "'" + exp["comentario"]
             )
             t3.download_button(
-                "⬇ Exportar",
+                "Exportar",
                 exp.to_csv(index=False, sep=";", date_format="%d/%m/%Y").encode("utf-8-sig"),
                 "respostas_nps.csv", "text/csv", width="stretch",
             )
@@ -632,7 +640,7 @@ with tab_tags:
     with st.container(border=True):
         h1, h3, h4 = st.columns([1, 4, 1], vertical_alignment="center")
         h1.subheader("Tags")
-        busca = h3.text_input("Buscar tags", placeholder="🔍 Buscar tags...",
+        busca = h3.text_input("Buscar tags", placeholder="Buscar tags...",
                               label_visibility="collapsed")
 
         # tags fixas: a lista fechada de temas da IA. Ela só sugere a qual tag
@@ -647,11 +655,11 @@ with tab_tags:
             columns={"nome": "Nome", "respostas": "Respostas",
                      "score": "Pontuação", "sentimento": "Sentimento"}
         ).to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-        h4.download_button("⬇ Exportar", csv, "tags_nps.csv", "text/csv", width="stretch")
+        h4.download_button("Exportar", csv, "tags_nps.csv", "text/csv", width="stretch")
 
         n_texto = int((dados["comentario"].str.strip() != "").sum())
         st.caption(
-            f"🤖 Tags pela análise sugerida: {len(analisadas_tg)} de {n_texto} comentários do "
+            f"Tags pela análise sugerida: {len(analisadas_tg)} de {n_texto} comentários do "
             "período classificados pelo worker de IA. A pontuação por tag segue a mesma regra "
             "do NPS da API, aplicada só às respostas daquele tema."
         )

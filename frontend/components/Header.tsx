@@ -1,32 +1,115 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useState } from "react";
-
-const LINKS = [
-  { href: "/", rotulo: "Início" },
-  { href: "/login", rotulo: "Login" },
-  { href: "/sobre", rotulo: "Sobre nós" },
-];
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import {
+  EVENTO_AUTH,
+  lerToken,
+  lerUsuario,
+  sair,
+  salvarUsuario,
+  usuarioLogado,
+  UsuarioResponse,
+} from "@/lib/api";
 
 export default function Header() {
   const caminho = usePathname();
+  const router = useRouter();
   const [aberto, setAberto] = useState(false);
+  const [adminLogado, setAdminLogado] = useState<UsuarioResponse | null>(null);
+
+  useEffect(() => {
+    let ativo = true;
+
+    async function sincronizarUsuario() {
+      const token = lerToken();
+      if (!token) {
+        if (ativo) setAdminLogado(null);
+        return;
+      }
+      const cache = lerUsuario();
+      if (cache) {
+        if (ativo) setAdminLogado(cache.papel === "ADMIN" ? cache : null);
+        return;
+      }
+      try {
+        const u = await usuarioLogado();
+        salvarUsuario(u);
+        if (ativo) setAdminLogado(u.papel === "ADMIN" ? u : null);
+      } catch {
+        if (ativo) setAdminLogado(null);
+      }
+    }
+
+    void sincronizarUsuario();
+    window.addEventListener(EVENTO_AUTH, sincronizarUsuario);
+    return () => {
+      ativo = false;
+      window.removeEventListener(EVENTO_AUTH, sincronizarUsuario);
+    };
+  }, [caminho]);
+
+  function encerrarSessao() {
+    sair();
+    setAdminLogado(null);
+    setAberto(false);
+    router.push("/login");
+  }
 
   const ativo = (href: string) =>
-    caminho === href || (href === "/login" && caminho === "/admin/login");
+    caminho === href ||
+    (href === "/login" && caminho === "/admin/login") ||
+    (href === "/admin/pesquisas" && caminho.startsWith("/admin/pesquisas"));
 
-  const links = LINKS.map((l) => (
-    <Link
-      key={l.href}
-      href={l.href}
-      className={`nav-link${ativo(l.href) ? " active" : ""}`}
-      onClick={() => setAberto(false)}
-    >
-      {l.rotulo}
-    </Link>
-  ));
+  const renderLinks = () => (
+    <>
+      <Link
+        href="/"
+        className={`nav-link${ativo("/") ? " active" : ""}`}
+        onClick={() => setAberto(false)}
+      >
+        Início
+      </Link>
+
+      {adminLogado ? (
+        <div className="nav-user-group">
+          <Link
+            href="/admin/pesquisas"
+            className={`nav-link nav-user-name${ativo("/admin/pesquisas") ? " active" : ""}`}
+            onClick={() => setAberto(false)}
+            title={`Logado como ${adminLogado.nome} (ADMIN)`}
+          >
+            {adminLogado.nome}
+          </Link>
+          <button
+            type="button"
+            className="nav-logout-btn"
+            onClick={encerrarSessao}
+            title="Encerrar sessão"
+          >
+            Sair
+          </button>
+        </div>
+      ) : (
+        <Link
+          href="/login"
+          className={`nav-link${ativo("/login") ? " active" : ""}`}
+          onClick={() => setAberto(false)}
+        >
+          Login
+        </Link>
+      )}
+
+      <Link
+        href="/sobre"
+        className={`nav-link${ativo("/sobre") ? " active" : ""}`}
+        onClick={() => setAberto(false)}
+      >
+        Sobre nós
+      </Link>
+    </>
+  );
 
   return (
     <header className="site-header">
@@ -36,7 +119,7 @@ export default function Header() {
           <span className="logo-tagline">Pesquisa de satisfação</span>
         </Link>
         {/* Links do menu */}
-        <nav className="main-nav">{links}</nav>
+        <nav className="main-nav">{renderLinks()}</nav>
         <button
           className="menu-toggle"
           aria-label="Menu"
@@ -49,7 +132,7 @@ export default function Header() {
         </button>
       </div>
       {/* Menu do celular */}
-      <div className={`mobile-nav${aberto ? " open" : ""}`}>{links}</div>
+      <div className={`mobile-nav${aberto ? " open" : ""}`}>{renderLinks()}</div>
     </header>
   );
 }

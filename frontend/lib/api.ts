@@ -6,6 +6,8 @@
  */
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const CHAVE_TOKEN = "token";
+const CHAVE_USUARIO = "usuario";
+export const EVENTO_AUTH = "keycore-auth-change";
 
 // ─── Tipos ───────────────────────────────────────────────────────────────────
 
@@ -44,6 +46,12 @@ export type PesquisaResponse = {
 export type PesquisaCreate = {
   titulo: string;
   texto_pergunta_nps: string;
+  texto_pergunta_aberta?: string | null;
+};
+
+export type PesquisaUpdate = {
+  titulo?: string;
+  texto_pergunta_nps?: string;
   texto_pergunta_aberta?: string | null;
 };
 
@@ -93,9 +101,17 @@ export class ApiError extends Error {
   }
 }
 
+function notificarAuth() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(EVENTO_AUTH));
+  }
+}
+
 export function salvarToken(token: string) {
   try {
+    const atual = sessionStorage.getItem(CHAVE_TOKEN);
     sessionStorage.setItem(CHAVE_TOKEN, token);
+    if (atual !== token) notificarAuth();
   } catch {}
 }
 
@@ -107,9 +123,29 @@ export function lerToken(): string | null {
   }
 }
 
+export function salvarUsuario(usuario: UsuarioResponse) {
+  try {
+    const novo = JSON.stringify(usuario);
+    const atual = sessionStorage.getItem(CHAVE_USUARIO);
+    sessionStorage.setItem(CHAVE_USUARIO, novo);
+    if (atual !== novo) notificarAuth();
+  } catch {}
+}
+
+export function lerUsuario(): UsuarioResponse | null {
+  try {
+    const raw = sessionStorage.getItem(CHAVE_USUARIO);
+    return raw ? (JSON.parse(raw) as UsuarioResponse) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function sair() {
   try {
     sessionStorage.removeItem(CHAVE_TOKEN);
+    sessionStorage.removeItem(CHAVE_USUARIO);
+    notificarAuth();
   } catch {}
 }
 
@@ -170,6 +206,17 @@ export function criarPesquisa(dados: PesquisaCreate) {
   return requisitar<PesquisaResponse>("/pesquisas", { method: "POST", body: JSON.stringify(dados) });
 }
 
+export function editarPesquisa(id: string, dados: PesquisaUpdate) {
+  return requisitar<PesquisaResponse>(`/pesquisas/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(dados),
+  });
+}
+
+export function excluirPesquisa(id: string) {
+  return requisitar<void>(`/pesquisas/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
 const ACAO_POR_STATUS: Partial<Record<StatusPesquisa, string>> = {
   PUBLICADA: "publicar",
   PAUSADA: "pausar",
@@ -192,6 +239,13 @@ export function gerarLinkPesquisa(id: string, tipo: TipoLinkPesquisa) {
 
 export function listarLinksPesquisa(id: string) {
   return requisitar<LinkPesquisaResponse[]>(`/pesquisas/${encodeURIComponent(id)}/links?limit=200`);
+}
+
+export function excluirLinkPesquisa(idPesquisa: string, idLink: string) {
+  return requisitar<void>(
+    `/pesquisas/${encodeURIComponent(idPesquisa)}/links/${encodeURIComponent(idLink)}`,
+    { method: "DELETE" },
+  );
 }
 
 // ─── Fluxo público (respondente, sem login) ──────────────────────────────────

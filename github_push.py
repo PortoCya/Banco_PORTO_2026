@@ -1,49 +1,61 @@
 """
-Script para fazer upload de todos os arquivos do projeto para o GitHub via API REST.
-Usa apenas bibliotecas padrão do Python (urllib + json + base64).
+Script para fazer commit atômico de todos os arquivos do projeto no GitHub via Git Data API REST.
+Ignora .env, .env.local, node_modules, venv, .next e bancos locais (.db) e bloqueia envio caso
+detecte qualquer token ou chave secreta (Gemini, OpenAI, GitHub PAT).
 
 Uso:
-    python github_push.py --token SEU_TOKEN_AQUI
-    ou defina a variável de ambiente GITHUB_TOKEN antes de rodar.
+    python github_push.py --token SEU_TOKEN_AQUI --message "titulo do commit"
 """
 import argparse
-import base64
 import json
 import os
+import re
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-# ─── Configuração ─────────────────────────────────────────────────────────────
 OWNER = "PortoCya"
 REPO = "Banco_PORTO_2026"
 BRANCH = "main"
 API_BASE = f"https://api.github.com/repos/{OWNER}/{REPO}"
-TIMEOUT_SEGUNDOS = 30  # toda chamada externa tem timeout explícito
+TIMEOUT_SEGUNDOS = 45
 
-# Arquivos/pastas a ignorar no upload
-IGNORAR = {
-    ".git", "__pycache__", "venv", "env", ".venv",
-    ".env", "*.db", "*.sqlite", "*.pyc"
+IGNORAR_NOMES = {
+    ".git",
+    "__pycache__",
+    "venv",
+    "env",
+    ".venv",
+    "node_modules",
+    ".next",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".env",
+    ".env.local",
 }
 
+IGNORAR_SUFIXOS = (".db", ".sqlite", ".sqlite3", ".pyc", ".pyo", ".tsbuildinfo", ".log")
 
-def deve_ignorar(path: Path) -> bool:
-    name = path.name
-    if name.startswith(".") and name not in {".env.example", ".gitignore"}:
-        return True
-    for pat in IGNORAR:
-        if pat.startswith("*"):
-            if name.endswith(pat[1:]):
-                return True
-        elif name == pat:
+PADROES_PROIBIDOS = re.compile(
+    r"(AIzaSy[A-Za-z0-9_-]{25,}|AQ\.Ab8RN[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{25,})"
+)
+
+
+def deve_ignorar(rel_path: Path) -> bool:
+    for part in rel_path.parts:
+        if part in IGNORAR_NOMES:
             return True
+        if part.startswith(".") and part not in {".env.example", ".env.local.example", ".gitignore", ".dockerignore", ".streamlit"}:
+            return True
+    name = rel_path.name
+    if name.endswith(IGNORAR_SUFIXOS):
+        return True
     return False
 
 
-def api_request(url: str, method: str, token: str, data: dict = None) -> dict:
-    body = json.dumps(data).encode("utf-8") if data else None
+def api_request(url: str, method: str, token: str, data: dict | None = None) -> dict:
+    body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(
         url,
         data=body,
@@ -53,132 +65,103 @@ def api_request(url: str, method: str, token: str, data: dict = None) -> dict:
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "ai-consulting-uploader/1.0",
+            "User-Agent": "nps-keycore-uploader/2.0",
         },
     )
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT_SEGUNDOS) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        raise RuntimeError(f"HTTP {e.code} em {url}: {body}")
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTP {e.code} em {url}: {err_body}")
 
 
-def get_file_sha(path_in_repo: str, token: str) -> str | None:
-    """Retorna o SHA do arquivo se já existir no repo (necessário para update)."""
-    url = f"{API_BASE}/contents/{path_in_repo}?ref={BRANCH}"
-    try:
-        result = api_request(url, "GET", token)
-        return result.get("sha")
-    except RuntimeError:
-        return None
-
-
-def upload_file(local_path: Path, repo_path: str, token: str, commit_message: str):
-    content = local_path.read_bytes()
-    content_b64 = base64.b64encode(content).decode("utf-8")
-    sha = get_file_sha(repo_path, token)
-
-    payload = {
-        "message": commit_message,
-        "content": content_b64,
-        "branch": BRANCH,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    url = f"{API_BASE}/contents/{repo_path}"
-    api_request(url, "PUT", token, payload)
-    action = "Atualizado" if sha else "Criado"
-    print(f"  [{action}] {repo_path}")
-
-
-def ensure_branch_exists(token: str):
-    """Cria o branch main se não existir (a partir do default branch)."""
-    try:
-        api_request(f"{API_BASE}/git/refs/heads/{BRANCH}", "GET", token)
-        print(f"Branch '{BRANCH}' ja existe.")
-    except RuntimeError:
-        # Pega o SHA do HEAD do repo
-        info = api_request(API_BASE, "GET", token)
-        default_branch = info.get("default_branch", "main")
-        if default_branch == BRANCH:
-            return
-        ref_info = api_request(
-            f"{API_BASE}/git/refs/heads/{default_branch}", "GET", token
-        )
-        sha = ref_info["object"]["sha"]
-        api_request(
-            f"{API_BASE}/git/refs",
-            "POST",
-            token,
-            {"ref": f"refs/heads/{BRANCH}", "sha": sha},
-        )
-        print(f"Branch '{BRANCH}' criado.")
-
-
-def collect_files(root: Path):
-    """Coleta todos os arquivos do projeto respeitando IGNORAR."""
-    files = []
+def collect_files(root: Path) -> list[Path]:
+    arquivos = []
     for path in sorted(root.rglob("*")):
         if path.is_file():
-            # Checa cada componente do caminho
-            skip = False
-            for part in path.relative_to(root).parts:
-                if deve_ignorar(Path(part)):
-                    skip = True
-                    break
-            if not skip:
-                files.append(path)
-    return files
+            rel = path.relative_to(root)
+            if not deve_ignorar(rel):
+                arquivos.append(path)
+    return arquivos
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Upload projeto para GitHub via API")
+    parser = argparse.ArgumentParser(description="Commit atomico para GitHub via Git Data API")
     parser.add_argument("--token", help="GitHub Personal Access Token")
+    parser.add_argument("--message", help="Mensagem do commit")
     args = parser.parse_args()
 
     token = args.token or os.environ.get("GITHUB_TOKEN")
     if not token:
-        print("ERRO: Forneça o token via --token ou variavel GITHUB_TOKEN")
-        print("       Crie em: https://github.com/settings/tokens")
-        print("       Permissoes necessarias: repo (read/write contents)")
-        sys.exit(1)
+        sys.exit("ERRO: Forneca o token via --token ou variavel GITHUB_TOKEN")
 
     root = Path(__file__).parent
-    print(f"\nRepositorio: https://github.com/{OWNER}/{REPO}")
-    print(f"Branch: {BRANCH}")
-    print(f"Diretorio local: {root}\n")
-
-    # Garante que o branch existe
-    ensure_branch_exists(token)
-
-    # Coleta e faz upload dos arquivos
     files = collect_files(root)
-    print(f"{len(files)} arquivo(s) para upload:\n")
 
-    erros = []
+    # 1. Varredura estrita contra qualquer vazamento de token ou chave
+    tree_items = []
     for local_path in files:
         repo_path = local_path.relative_to(root).as_posix()
-        try:
-            upload_file(
-                local_path,
-                repo_path,
-                token,
-                commit_message=f"chore: add {repo_path}",
-            )
-        except Exception as exc:
-            print(f"  [ERRO] {repo_path}: {exc}")
-            erros.append((repo_path, str(exc)))
+        conteudo = local_path.read_text(encoding="utf-8")
+        match = PADROES_PROIBIDOS.search(conteudo)
+        if match:
+            sys.exit(f"BLOQUEADO POR SEGURANCA: Segredo/Token detectado em '{repo_path}'!")
+        tree_items.append({
+            "path": repo_path,
+            "mode": "100644",
+            "type": "blob",
+            "content": conteudo,
+        })
 
-    print(f"\n{'='*60}")
-    print(f"Upload concluido: {len(files) - len(erros)}/{len(files)} arquivos")
-    if erros:
-        print(f"{len(erros)} erro(s):")
-        for path, msg in erros:
-            print(f"  - {path}: {msg}")
-    else:
-        print(f"Repositorio: https://github.com/{OWNER}/{REPO}")
+    print(f"Auditoria de seguranca concluida: {len(tree_items)} arquivos verificados (0 segredos encontrados).")
+
+    # 2. Obtem o commit atual da branch main
+    ref_data = api_request(f"{API_BASE}/git/refs/heads/{BRANCH}", "GET", token)
+    base_commit_sha = ref_data["object"]["sha"]
+    commit_data = api_request(f"{API_BASE}/git/commits/{base_commit_sha}", "GET", token)
+    base_tree_sha = commit_data["tree"]["sha"]
+
+    # 3. Cria a nova arvore Git
+    new_tree = api_request(
+        f"{API_BASE}/git/trees",
+        "POST",
+        token,
+        {"base_tree": base_tree_sha, "tree": tree_items},
+    )
+    new_tree_sha = new_tree["sha"]
+
+    if new_tree_sha == base_tree_sha:
+        print("Nenhuma alteracao pendente para commit.")
+        return
+
+    commit_msg = args.message or "feat: atualiza frontend, dashboard, rotas de gestao e scripts de execucao"
+
+    # 4. Cria o commit unico na main
+    new_commit = api_request(
+        f"{API_BASE}/git/commits",
+        "POST",
+        token,
+        {
+            "message": commit_msg,
+            "tree": new_tree_sha,
+            "parents": [base_commit_sha],
+        },
+    )
+    new_commit_sha = new_commit["sha"]
+
+    # 5. Atualiza a referencia heads/main
+    api_request(
+        f"{API_BASE}/git/refs/heads/{BRANCH}",
+        "PATCH",
+        token,
+        {"sha": new_commit_sha, "force": False},
+    )
+
+    print(f"Commit realizado com sucesso na branch '{BRANCH}'!")
+    print(f"SHA: {new_commit_sha}")
+    print(f"URL: https://github.com/{OWNER}/{REPO}/commit/{new_commit_sha}")
+
 
 if __name__ == "__main__":
     main()

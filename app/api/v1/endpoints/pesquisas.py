@@ -8,9 +8,9 @@ import uuid
 from datetime import date
 from typing import Iterator, List, Optional
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,7 @@ from app.api.deps import Paginacao, paginacao, requer_papel
 from app.core.database import SessionLocal, get_db
 from app.core.errors import ConflictError, ForbiddenError, InvalidInputError, NotFoundError
 from app.models.models import (
-    AnaliseFeedback, LinkPesquisa, LogExportacao, Pesquisa, SnapshotNps, Submissao, Usuario,
+    AnaliseFeedback, JobIa, LinkPesquisa, LogExportacao, Pesquisa, SnapshotNps, Submissao, Usuario,
 )
 from app.schemas.schemas import (
     LinkPesquisaCreate, LinkPesquisaResponse, NpsResponse, PesquisaCreate,
@@ -151,6 +151,40 @@ def atualizar_pesquisa(
     return nova
 
 
+@router.delete("/pesquisas/{id_pesquisa}", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Excluir pesquisa e seus vínculos")
+def excluir_pesquisa(
+    id_pesquisa: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: Usuario = Depends(_admin),
+):
+    """**Códigos:** 204 | 401 | 403 | 404 | 422"""
+    pesquisa = _buscar_pesquisa(db, id_pesquisa, travar=True)
+    antes = estado_pesquisa(pesquisa)
+
+    # Desvincula eventuais versões filhas para não violar FK auto-referenciada
+    db.execute(
+        update(Pesquisa).where(Pesquisa.id_pesquisa_pai == id_pesquisa).values(id_pesquisa_pai=None)
+    )
+
+    ids_submissoes = list(
+        db.execute(select(Submissao.id).where(Submissao.id_pesquisa == id_pesquisa)).scalars()
+    )
+    if ids_submissoes:
+        db.execute(delete(AnaliseFeedback).where(AnaliseFeedback.id_submissao.in_(ids_submissoes)))
+        db.execute(delete(JobIa).where(JobIa.id_submissao.in_(ids_submissoes)))
+        db.execute(delete(Submissao).where(Submissao.id_pesquisa == id_pesquisa))
+
+    db.execute(delete(LinkPesquisa).where(LinkPesquisa.id_pesquisa == id_pesquisa))
+    db.execute(delete(SnapshotNps).where(SnapshotNps.id_pesquisa == id_pesquisa))
+    db.execute(delete(LogExportacao).where(LogExportacao.id_pesquisa == id_pesquisa))
+
+    registrar_auditoria(db, admin, "EXCLUIR_PESQUISA", "PESQUISA", pesquisa.id, estado_antes=antes)
+    db.delete(pesquisa)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # ══════════════════════════════════════════════════════════════════
 # Ciclo de vida: RASCUNHO → PUBLICADA ⇄ PAUSADA → ARQUIVADA
 # ══════════════════════════════════════════════════════════════════
@@ -239,6 +273,42 @@ def listar_links(id_pesquisa: uuid.UUID, pag: Paginacao = Depends(paginacao), db
         .order_by(LinkPesquisa.criado_em.desc(), LinkPesquisa.id)
         .offset(pag.skip).limit(pag.limit)
     ).scalars().all()
+
+
+@router.delete("/pesquisas/{id_pesquisa}/links/{id_link}", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Excluir link de pesquisa (preservando respostas já enviadas)")
+def excluir_link(
+    id_pesquisa: uuid.UUID,
+    id_link: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: Usuario = Depends(_admin),
+):
+    """**Códigos:** 204 | 401 | 403 | 404 | 422"""
+    _buscar_pesquisa(db, id_pesquisa)
+    link = db.execute(
+        select(LinkPesquisa).where(
+            LinkPesquisa.id == id_link,
+            LinkPesquisa.id_pesquisa == id_pesquisa,
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise NotFoundError("Link de pesquisa não encontrado.")
+
+    # Preserva as respostas já coletadas desvinculando o id_link_pesquisa (nullable)
+    db.execute(
+        update(Submissao).where(Submissao.id_link_pesquisa == id_link).values(id_link_pesquisa=None)
+    )
+    registrar_auditoria(
+        db,
+        admin,
+        "EXCLUIR_LINK_PESQUISA",
+        "LINK_PESQUISA",
+        link.id,
+        estado_antes={"id_pesquisa": str(id_pesquisa), "tipo": link.tipo},
+    )
+    db.delete(link)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ══════════════════════════════════════════════════════════════════

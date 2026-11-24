@@ -1,35 +1,43 @@
 "use client";
 
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import {
   alterarStatusPesquisa,
   ApiError,
   criarPesquisa,
+  editarPesquisa,
+  EVENTO_AUTH,
+  excluirLinkPesquisa,
+  excluirPesquisa,
   gerarLinkPesquisa,
+  lerToken,
   LinkPesquisaResponse,
   listarLinksPesquisa,
   listarPesquisas,
   PesquisaResponse,
+  salvarUsuario,
   TipoLinkPesquisa,
+  usuarioLogado,
 } from "@/lib/api";
 
 type LinksPorPesquisa = Record<string, LinkPesquisaResponse[]>;
 type NichoTemplate = "SUPORTE" | "ECOMMERCE";
+type StatusAuth = "verificando" | "autorizado" | "nao_encontrado";
 
 function mensagemErro(erro: unknown) {
   if (erro instanceof ApiError) {
-    if (erro.status === 401) return "Faça login para acessar a gestão de pesquisas.";
-    if (erro.status === 403) return "Esta área exige uma conta com papel ADMIN.";
     return erro.message;
   }
   return "Não foi possível concluir a operação. Tente novamente.";
 }
 
 export default function GestaoPesquisas() {
+  const [statusAuth, setStatusAuth] = useState<StatusAuth>("verificando");
   const [pesquisas, setPesquisas] = useState<PesquisaResponse[]>([]);
   const [links, setLinks] = useState<LinksPorPesquisa>({});
-  
+
   // Estados configurados com os 2 nichos definidos pelo mentor
   const [nichoSelecionado, setNichoSelecionado] = useState<NichoTemplate>("SUPORTE");
   const [titulo, setTitulo] = useState("Pós-atendimento de Suporte — KeyCore");
@@ -40,9 +48,16 @@ export default function GestaoPesquisas() {
     "Qual é o principal motivo para a sua nota sobre a resolução do chamado?",
   );
 
+  // Estado de edição inline de uma pesquisa existente
+  const [editandoId, setEditandoId] = useState<string | null>(null);
+  const [editTitulo, setEditTitulo] = useState("");
+  const [editPerguntaNps, setEditPerguntaNps] = useState("");
+  const [editPerguntaAberta, setEditPerguntaAberta] = useState("");
+
   const [carregando, setCarregando] = useState(true);
   const [salvando, setSalvando] = useState(false);
   const [acaoId, setAcaoId] = useState<string | null>(null);
+  const [linkExcluindoId, setLinkExcluindoId] = useState<string | null>(null);
   const [erro, setErro] = useState<string | null>(null);
   const [sucesso, setSucesso] = useState<string | null>(null);
 
@@ -76,6 +91,10 @@ export default function GestaoPesquisas() {
       );
       setLinks(Object.fromEntries(paresLinks));
     } catch (falha) {
+      if (falha instanceof ApiError && (falha.status === 401 || falha.status === 403)) {
+        setStatusAuth("nao_encontrado");
+        return;
+      }
       setErro(mensagemErro(falha));
     } finally {
       setCarregando(false);
@@ -83,8 +102,55 @@ export default function GestaoPesquisas() {
   }, []);
 
   useEffect(() => {
-    void carregarDados();
+    let ativo = true;
+
+    async function inicializar() {
+      const token = lerToken();
+      if (!token) {
+        if (ativo) setStatusAuth("nao_encontrado");
+        return;
+      }
+      try {
+        const user = await usuarioLogado();
+        if (!ativo) return;
+        salvarUsuario(user);
+        if (user.papel !== "ADMIN") {
+          setStatusAuth("nao_encontrado");
+          return;
+        }
+        setStatusAuth("autorizado");
+        await carregarDados();
+      } catch {
+        if (ativo) setStatusAuth("nao_encontrado");
+      }
+    }
+
+    function aoMudarAuth() {
+      if (!lerToken() && ativo) {
+        setStatusAuth("nao_encontrado");
+      }
+    }
+
+    void inicializar();
+    window.addEventListener(EVENTO_AUTH, aoMudarAuth);
+    return () => {
+      ativo = false;
+      window.removeEventListener(EVENTO_AUTH, aoMudarAuth);
+    };
   }, [carregarDados]);
+
+  if (statusAuth === "nao_encontrado") {
+    notFound();
+  }
+
+  if (statusAuth === "verificando") {
+    return (
+      <div className="carregando" aria-live="polite">
+        <span className="carregando-spinner" />
+        Verificando acesso...
+      </div>
+    );
+  }
 
   async function criar(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -103,6 +169,70 @@ export default function GestaoPesquisas() {
       setErro(mensagemErro(falha));
     } finally {
       setSalvando(false);
+    }
+  }
+
+  function iniciarEdicao(pesquisa: PesquisaResponse) {
+    setEditandoId(pesquisa.id);
+    setEditTitulo(pesquisa.titulo);
+    setEditPerguntaNps(pesquisa.texto_pergunta_nps);
+    setEditPerguntaAberta(pesquisa.texto_pergunta_aberta ?? "");
+    setErro(null);
+    setSucesso(null);
+  }
+
+  function cancelarEdicao() {
+    setEditandoId(null);
+  }
+
+  async function salvarEdicao(e: FormEvent<HTMLFormElement>, pesquisaOriginal: PesquisaResponse) {
+    e.preventDefault();
+    setAcaoId(pesquisaOriginal.id);
+    setErro(null);
+    setSucesso(null);
+    try {
+      const atualizada = await editarPesquisa(pesquisaOriginal.id, {
+        titulo: editTitulo.trim(),
+        texto_pergunta_nps: editPerguntaNps.trim(),
+        texto_pergunta_aberta: editPerguntaAberta.trim() || null,
+      });
+      setEditandoId(null);
+      if (atualizada.id !== pesquisaOriginal.id) {
+        setSucesso(
+          `Nova versão (v${atualizada.numero_versao}) criada como rascunho para preservar o histórico das respostas anteriores.`,
+        );
+      } else {
+        setSucesso(`Pesquisa “${atualizada.titulo}” atualizada com sucesso.`);
+      }
+      await carregarDados();
+    } catch (falha) {
+      setErro(mensagemErro(falha));
+    } finally {
+      setAcaoId(null);
+    }
+  }
+
+  async function removerPesquisa(pesquisa: PesquisaResponse) {
+    if (!window.confirm(`Tem certeza que deseja excluir a pesquisa “${pesquisa.titulo}” e todos os seus links?`)) {
+      return;
+    }
+    setAcaoId(pesquisa.id);
+    setErro(null);
+    setSucesso(null);
+    try {
+      await excluirPesquisa(pesquisa.id);
+      setPesquisas((atuais) => atuais.filter((p) => p.id !== pesquisa.id));
+      setLinks((atuais) => {
+        const copia = { ...atuais };
+        delete copia[pesquisa.id];
+        return copia;
+      });
+      if (editandoId === pesquisa.id) setEditandoId(null);
+      setSucesso(`Pesquisa “${pesquisa.titulo}” excluída.`);
+    } catch (falha) {
+      setErro(mensagemErro(falha));
+    } finally {
+      setAcaoId(null);
     }
   }
 
@@ -139,6 +269,24 @@ export default function GestaoPesquisas() {
     }
   }
 
+  async function removerLink(pesquisa: PesquisaResponse, link: LinkPesquisaResponse) {
+    setLinkExcluindoId(link.id);
+    setErro(null);
+    setSucesso(null);
+    try {
+      await excluirLinkPesquisa(pesquisa.id, link.id);
+      setLinks((atuais) => ({
+        ...atuais,
+        [pesquisa.id]: (atuais[pesquisa.id] ?? []).filter((l) => l.id !== link.id),
+      }));
+      setSucesso(`Link excluído de “${pesquisa.titulo}”.`);
+    } catch (falha) {
+      setErro(mensagemErro(falha));
+    } finally {
+      setLinkExcluindoId(null);
+    }
+  }
+
   return (
     <section className="survey-admin">
       <div className="survey-admin-heading">
@@ -147,7 +295,6 @@ export default function GestaoPesquisas() {
           <h1 className="page-title">Pesquisas <em>NPS</em></h1>
           <p className="page-text">Crie, publique e compartilhe pesquisas de satisfação.</p>
         </div>
-        <Link className="survey-secondary-link" href="/admin/login">Acesso ADMIN</Link>
       </div>
 
       <section className="survey-panel" aria-labelledby="nova-pesquisa-titulo">
@@ -224,7 +371,7 @@ export default function GestaoPesquisas() {
 
       {erro && (
         <p className="survey-alert error" role="alert">
-          {erro} {erro.includes("Faça login") && <Link href="/admin/login">Entrar</Link>}
+          {erro}
         </p>
       )}
       {sucesso && <p className="survey-alert success" role="status">{sucesso}</p>}
@@ -255,38 +402,113 @@ export default function GestaoPesquisas() {
                   <div>
                     <h3>{pesquisa.titulo}</h3>
                     <p>{pesquisa.texto_pergunta_nps}</p>
+                    {pesquisa.texto_pergunta_aberta && (
+                      <p className="survey-open-question">Aberta: {pesquisa.texto_pergunta_aberta}</p>
+                    )}
                   </div>
                   <span className={`survey-status ${pesquisa.status.toLowerCase()}`}>{pesquisa.status}</span>
                 </div>
                 <p className="survey-version">Versão {pesquisa.numero_versao}</p>
-                <div className="survey-actions">
-                  {pesquisa.status !== "PUBLICADA" && pesquisa.status !== "ARQUIVADA" && (
+
+                {editandoId === pesquisa.id ? (
+                  <form className="survey-form survey-edit-box" onSubmit={(e) => void salvarEdicao(e, pesquisa)}>
+                    <label>
+                      Título
+                      <input
+                        value={editTitulo}
+                        onChange={(e) => setEditTitulo(e.target.value)}
+                        required
+                        minLength={3}
+                        maxLength={300}
+                      />
+                    </label>
+                    <label>
+                      Pergunta NPS
+                      <textarea
+                        value={editPerguntaNps}
+                        onChange={(e) => setEditPerguntaNps(e.target.value)}
+                        required
+                        minLength={5}
+                        maxLength={1000}
+                        rows={2}
+                      />
+                    </label>
+                    <label>
+                      Pergunta aberta <span className="survey-optional">(opcional)</span>
+                      <textarea
+                        value={editPerguntaAberta}
+                        onChange={(e) => setEditPerguntaAberta(e.target.value)}
+                        maxLength={1000}
+                        rows={2}
+                      />
+                    </label>
+                    <div className="survey-actions">
+                      <button
+                        className="btn-primario"
+                        type="submit"
+                        disabled={acaoId === pesquisa.id}
+                      >
+                        {acaoId === pesquisa.id ? "Salvando..." : "Salvar alterações"}
+                      </button>
+                      <button
+                        className="survey-outline-button"
+                        type="button"
+                        onClick={cancelarEdicao}
+                        disabled={acaoId === pesquisa.id}
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <div className="survey-actions">
+                    {pesquisa.status !== "PUBLICADA" && pesquisa.status !== "ARQUIVADA" && (
+                      <button
+                        className="btn-primario"
+                        type="button"
+                        disabled={acaoId === pesquisa.id}
+                        onClick={() => void publicar(pesquisa)}
+                      >
+                        {acaoId === pesquisa.id ? "Processando..." : "Publicar"}
+                      </button>
+                    )}
                     <button
-                      className="btn-primario"
+                      className="survey-outline-button"
                       type="button"
                       disabled={acaoId === pesquisa.id}
-                      onClick={() => void publicar(pesquisa)}
+                      onClick={() => void criarLink(pesquisa, "ABERTO")}
                     >
-                      {acaoId === pesquisa.id ? "Processando..." : "Publicar"}
+                      Gerar link aberto
                     </button>
-                  )}
-                  <button
-                    className="survey-outline-button"
-                    type="button"
-                    disabled={acaoId === pesquisa.id}
-                    onClick={() => void criarLink(pesquisa, "ABERTO")}
-                  >
-                    Gerar link aberto
-                  </button>
-                  <button
-                    className="survey-outline-button"
-                    type="button"
-                    disabled={acaoId === pesquisa.id}
-                    onClick={() => void criarLink(pesquisa, "NOMINAL")}
-                  >
-                    Gerar link nominal
-                  </button>
-                </div>
+                    <button
+                      className="survey-outline-button"
+                      type="button"
+                      disabled={acaoId === pesquisa.id}
+                      onClick={() => void criarLink(pesquisa, "NOMINAL")}
+                    >
+                      Gerar link nominal
+                    </button>
+                    {pesquisa.status !== "ARQUIVADA" && (
+                      <button
+                        className="survey-outline-button"
+                        type="button"
+                        disabled={acaoId === pesquisa.id}
+                        onClick={() => iniciarEdicao(pesquisa)}
+                      >
+                        Editar
+                      </button>
+                    )}
+                    <button
+                      className="survey-danger-button"
+                      type="button"
+                      disabled={acaoId === pesquisa.id}
+                      onClick={() => void removerPesquisa(pesquisa)}
+                    >
+                      Excluir pesquisa
+                    </button>
+                  </div>
+                )}
+
                 {(links[pesquisa.id] ?? []).length > 0 && (
                   <div className="survey-links">
                     <h4>Links de resposta</h4>
@@ -294,9 +516,22 @@ export default function GestaoPesquisas() {
                       const url = `/pesquisa/${encodeURIComponent(link.token)}`;
                       return (
                         <div className="survey-link-row" key={link.id}>
-                          <span className={`survey-link-type ${link.tipo.toLowerCase()}`}>{link.tipo}</span>
-                          <Link href={url} target="_blank" rel="noreferrer">{url}</Link>
-                          {link.tipo === "NOMINAL" && link.usado_em && <span className="survey-link-used">Já utilizado</span>}
+                          <div className="survey-link-info">
+                            <span className={`survey-link-type ${link.tipo.toLowerCase()}`}>{link.tipo}</span>
+                            <Link href={url} target="_blank" rel="noreferrer">{url}</Link>
+                            {link.tipo === "NOMINAL" && link.usado_em && (
+                              <span className="survey-link-used">Já utilizado</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            className="survey-link-delete"
+                            disabled={linkExcluindoId === link.id}
+                            onClick={() => void removerLink(pesquisa, link)}
+                            title="Excluir este link"
+                          >
+                            {linkExcluindoId === link.id ? "Excluindo..." : "Excluir"}
+                          </button>
                         </div>
                       );
                     })}

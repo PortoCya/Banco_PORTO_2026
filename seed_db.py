@@ -109,6 +109,12 @@ def popular(demo: bool, demo_token: str | None = None) -> None:
 
         if demo:
             _garantir_demo(db, admin, demo_token)
+            # Em modo --demo, garante que haja uma versão de modelo ativa para o worker classificar as tags
+            if db.execute(select(VersaoModelo).where(VersaoModelo.ativo.is_(True))).scalar_one_or_none() is None:
+                primeira_versao = db.execute(select(VersaoModelo).limit(1)).scalar_one_or_none()
+                if primeira_versao is not None:
+                    primeira_versao.ativo = True
+                    logger.info("Versão de modelo '%s' ativada para demonstração.", primeira_versao.rotulo_versao)
 
         db.commit()   # tudo ou nada
 

@@ -38,6 +38,25 @@ Front (Next.js) ──HTTP──▶ API (FastAPI) ──▶ PostgreSQL ◀──
 
 ## Rodando em desenvolvimento
 
+### Atalho rápido no Windows (`rodar.bat`)
+
+Depois de configurar o ambiente virtual (`venv`), instalar as dependências do `frontend/` (`npm ci`) e preencher o `.env`, basta executar:
+
+```powershell
+.\rodar.bat
+```
+
+O menu interativo do `rodar.bat` aplica as migrations (`alembic upgrade head`), garante o seed de demonstração (`seed_db.py --demo`), libera as portas e permite subir:
+- **`[1]`** Tudo de uma vez: API (`:8000`) + Frontend Next.js (`:3000`) + Dashboard Streamlit (`:8501`) + Worker de IA
+- **`[2]`** API (`:8000`) + Frontend Next.js (`:3000`)
+- **`[3]`** Apenas API Backend (`:8000`)
+- **`[4]`** API (`:8000`) + Dashboard Streamlit (`:8501`)
+- **`[5]`** Worker de IA (`python -m app.ia.worker`)
+- **`[6]`** Suíte de testes (`pytest`)
+- **`[0]`** Fechar todas as portas (`fechar_portas.bat`)
+
+### Passo a passo manual
+
 ```bash
 python -m venv venv && source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements-dev.txt
@@ -105,10 +124,10 @@ O banco apontado por `TEST_DATABASE_URL` é **apagado e recriado** a cada teste.
 | POST | `/auth/login` | público (rate limit por IP e por e-mail) |
 | GET | `/auth/me` | autenticado |
 | POST/GET | `/usuarios` · GET/PATCH/DELETE `/usuarios/{id}` | ADMIN |
-| POST | `/pesquisas` · PATCH `/pesquisas/{id}` | ADMIN |
+| POST | `/pesquisas` · PATCH/DELETE `/pesquisas/{id}` | ADMIN |
 | GET | `/pesquisas` · `/pesquisas/{id}` | ANALYST/ADMIN |
 | POST | `/pesquisas/{id}/publicar` · `/pausar` · `/arquivar` | ADMIN |
-| POST/GET | `/pesquisas/{id}/links` | ADMIN |
+| POST/GET | `/pesquisas/{id}/links` · DELETE `/pesquisas/{id}/links/{id_link}` | ADMIN |
 | GET/POST | `/public/respostas/{token}` | público (rate limit por IP) |
 | GET | `/pesquisas/{id}/nps` · `/nps/historico` | ANALYST/ADMIN |
 | GET | `/pesquisas/{id}/respostas` (para os painéis, comentário anonimizado) | ANALYST/ADMIN |
